@@ -62,6 +62,7 @@ public class MainActivity extends Activity {
     Switch sysSwitch;
     int mode=0; // 0=目标应用 1=禁用应用
     File cfgFile;
+    File crashFile(){ return new File(getFilesDir(),"config.txt.crash"); } // 与守护 ${config_file}.crash 对齐
     final ArrayList<AppInfo> allApps=new ArrayList<>();
 
     volatile boolean rootGranted=false, rootChecked=false, serviceRunning=false;
@@ -1203,6 +1204,41 @@ public class MainActivity extends Activity {
                                 st = nl + 1;
                             }
                         }
+                    }
+                }
+            }catch(Throwable ignored){}
+            // (C) 载入守护崩溃日志 config.txt.crash —— 上一次守护 FORTIFY/SIGSEGV 后
+            // crash_handler 会把 signal/code/errno/addr 和 maps 写到这里，展示给用户
+            // 便于排查"切回应用后服务停止"这类偶发崩溃。
+            try{
+                File cf = crashFile();
+                if(cf.exists() && cf.length()>0){
+                    long len = cf.length();
+                    long from = (len > 32*1024L) ? (len - 32*1024L) : 0L;
+                    java.io.FileInputStream fi = new java.io.FileInputStream(cf);
+                    fi.skip(from);
+                    byte[] raw = new byte[(int)(len - from)];
+                    int n = fi.read(raw); fi.close();
+                    if (n > 0) {
+                        String s = new String(raw, 0, n, "UTF-8");
+                        final String banner = "======== 守护崩溃日志（上次异常退出现场）========\n" + s
+                                + (s.endsWith("\n")?"":"\n")
+                                + "================ 崩溃日志 end ================\n";
+                        runOnUiThread(()->{
+                            synchronized (logLock) {
+                                logBuffer.insert(0, banner);
+                                if(logBuffer.length()>30000) logBuffer.setLength(30000);
+                                logView.setText(logBuffer.toString());
+                            }
+                        });
+                        // 只展示一次：展示完就删掉（root 兜底，避免 chmod 异常）
+                        try{ new java.io.FileOutputStream(cf, false).close(); }catch(Throwable ignored){}
+                        try{
+                            ProcessBuilder pb = new ProcessBuilder("su","-c","rm -f "+shq(cf.getAbsolutePath())+"; echo ok");
+                            Process p = pb.start();
+                            p.getOutputStream().close();
+                            p.waitFor();
+                        }catch(Throwable ignored){}
                     }
                 }
             }catch(Throwable ignored){}

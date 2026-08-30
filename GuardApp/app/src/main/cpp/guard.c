@@ -65,9 +65,118 @@ static bool active;
 static char current_fg[MAX_PKG];
 static struct stat cfg_stat;
 static bool cfg_stat_valid;
+/* 崩溃现场落盘路径：在守护 SIGSEGV / SIGBUS / SIGABRT / SIGFPE 等致命信号触发
+ * 时，把信号号、errno、PID、最后已知上下文写到 ${config_file}.crash，便于下次
+ * UI 启动时读取呈现给用户，定位 FORTIFY / 非法地址 等偶发崩溃。*/
+static char crash_file[MAX_PATH];
 
 static bool reload_if_changed(void);
 static void remove_pidfile(void);    /* forward decl：供 signal_handler / atexit 使用 */
+
+/* 直接用系统调用写字符串（不走 stdio FILE* / vfprintf 锁路径）。
+ * 当 Bionic FORTIFY 打印 "pthread_mutex_lock called on a destroyed mutex" 前后，
+ * stderr 对应的 FILE* 内部锁可能已经被同进程其它线程（通常是 libbinder/zygote
+ * 继承下来的背景线程）破坏；再走 fprintf/vfprintf 会二次命中 FORTIFY 再被
+ * SIGABRT。因此崩溃路径用 write() 直写 fd，完全绕开 FILE* 层。*/
+static void raw_write(int fd, const char *s)
+{
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n > 0) {
+        ssize_t w = write(fd, s, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        n -= (size_t)w;
+        s += (size_t)w;
+    }
+}
+static void raw_write_i(int fd, long v)
+{
+    char buf[24]; int p = 0;
+    unsigned long uv;
+    if (v < 0) {
+        raw_write(fd, "-");
+        uv = (unsigned long)(-(v + 1)) + 1UL;  /* 避免 -LONG_MIN 的溢出 */
+    } else {
+        uv = (unsigned long)v;
+    }
+    if (uv == 0) buf[p++] = '0';
+    while (uv > 0 && p < (int)sizeof(buf) - 1) {
+        buf[p++] = (char)('0' + (uv % 10));
+        uv /= 10;
+    }
+    for (int i = 0, j = p - 1; i < j; i++, j--) { char t = buf[i]; buf[i] = buf[j]; buf[j] = t; }
+    buf[p] = 0;
+    raw_write(fd, buf);
+}
+
+static void crash_handler(int sig, siginfo_t *si, void *ctx)
+{
+    (void)ctx;
+    /* 第一步：pidfile 先删掉，避免 UI 误以为服务还在。 */
+    remove_pidfile();
+
+    /* 第二步：崩溃现场写 crash_file + stderr (fd=2) 双通道 */
+    char line[192];
+    int cfd = -1;
+    if (crash_file[0]) {
+        cfd = open(crash_file, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    }
+#define W(fd, s) raw_write(fd, s)
+    W(2, "\n[Guard][CRASH] signal=");
+    raw_write_i(2, sig);
+    W(2, " pid="); raw_write_i(2, (long)getpid());
+    W(2, " code="); raw_write_i(2, si ? (long)si->si_code : -1L);
+    W(2, " errno="); raw_write_i(2, (long)errno);
+    W(2, "\n");
+    if (cfd >= 0) {
+        /* 把 fd 2 上的同一段文本再给 crash_file */
+        int len = snprintf(line, sizeof(line),
+                           "signal=%d code=%d errno=%d addr=%p pid=%d ppid=%d uid=%d\n",
+                           sig,
+                           si ? si->si_code : -1,
+                           errno,
+                           si ? si->si_addr : NULL,
+                           (int)getpid(),
+                           (int)getppid(),
+                           (int)getuid());
+        if (len > 0) (void)write(cfd, line, (size_t)len);
+        /* 再附带一段 ASCII stack 回溯提示：通过 /proc/self/maps 前 8 行，
+         * 便于将来进一步符号化；此处不强制解析，仅留线索。 */
+        int maps = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+        if (maps >= 0) {
+            char buf[2048];
+            ssize_t r = read(maps, buf, sizeof(buf) - 1);
+            if (r > 0) {
+                (void)write(cfd, "maps:\n", 6);
+                (void)write(cfd, buf, (size_t)r);
+                (void)write(cfd, "\n", 1);
+            }
+            close(maps);
+        }
+        close(cfd);
+    }
+#undef W
+    /* 致命信号不返回：恢复默认处理器然后再 raise 一次，让内核正确写入退出状态 */
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+static void install_crash_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    int sigs[] = { SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL, SIGSYS, SIGTRAP };
+    for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        (void)sigaction(sigs[i], &sa, NULL);
+    }
+}
 
 static void signal_handler(int sig)
 {
@@ -708,11 +817,62 @@ typedef struct {
     bool  has_guard_task;     // environ 中 GUARD_TASK=1
     bool  critical;           // 系统关键进程（绝不杀）
     bool  is_guard_self;      // Guard 应用自身的 UI/Service 进程（允许杀，只留守护）
-    bool  protect;            // 用户"管理类二进制"白名单（绝不杀），由 GUARD_TASK=1 且非包装层 + 祖先链传播
+    bool  protect;            // 用户"管理类二进制"白名单（绝不杀），GUARD_TASK=1 且 非包装层且确认为真实原生二进制
     bool  is_script_wrapper;  // 进程名属于 shell/su/工具包装层（可作为清理种子）
+    bool  is_jvm_app;         // cmdline/exe 表明是 zygote 派生的 Android App（app_process/java/dalvikvm），不计入"用户二进制"
     char  cmdline0[MAX_PKG];  // cmdline 首段（常等于包名或 "包名:service"）
+    char  exe_link[MAX_PATH]; // /proc/<pid>/exe 符号链接目的（能读到则填；读不到空串）
     char  name[MAX_NAME];
 } ProcRecord;
+
+/* 判定一个进程"更像 Android 应用（Java 虚拟机）进程"，而不是用户自己通过
+ * 脚本 exec 替换加载的原生 ELF。
+ * 脚本里 `export GUARD_TASK=1` 之后如果 run-as、am、或脚本里通过 app_process
+ * 拉起了某个 App 的组件，那么这些 App 进程会继承 GUARD_TASK=1，之前只按
+ * 「GUARD_TASK=1 且 !wrapper」算 protect 会导致 protect_n 虚高（用户反馈 50/52）。
+ * 现在在 Phase B protect 之前先通过 exe_link 和 cmdline0 排除：
+ *   - exe 链接到 system 分区的 app_process32 / app_process64 / dalvikvm /
+ *     dalvikvm32 / art 等 JVM 启动器；
+ *   - cmdline0 典型形态「com.xxx.yyy」或「process:acra」「process:xxxservice」
+ *     这种典型包名+冒号子进程名，且 exe 指向 app_process 系列。 */
+static bool looks_like_android_app_process(ProcRecord *r)
+{
+    if (!r) return false;
+
+    const char *ex = r->exe_link;
+
+    /* 1) 通过 /proc/<pid>/exe 识别：只要链接到 app_process* / dalvikvm* / art */
+    if (ex && ex[0]) {
+        const char *base = strrchr(ex, '/');
+        base = base ? base + 1 : ex;
+        if (strncmp(base, "app_process", 11) == 0) return true;
+        if (strncmp(base, "dalvikvm", 8) == 0) return true;
+        if (strncmp(base, "art", 3) == 0 && (base[3] == '\0' || base[3] == '6' || base[3] == '3')) return true;
+        if (strcmp(base, "java") == 0) return true;
+    }
+
+    /* 2) cmdline0 特征匹配：「包名:子进程」或者「形如 com.xxx 的包名」且短名
+     *    就是 app_process*，双重避免误伤。*/
+    if (r->cmdline0[0]) {
+        /* 含有冒号子进程后缀且 cmdline0 形如 pkg:xxx => Android 系统特征 */
+        const char *colon = strchr(r->cmdline0, ':');
+        if (colon && colon != r->cmdline0) return true;
+        /* 典型包名：至少包含两个点，且以字母/下划线开头，如 com.example.guard */
+        int dots = 0;
+        for (const char *p = r->cmdline0; *p; p++) if (*p == '.') dots++;
+        if (dots >= 2) {
+            bool ok_start = ((*r->cmdline0 >= 'a' && *r->cmdline0 <= 'z') ||
+                             (*r->cmdline0 >= 'A' && *r->cmdline0 <= 'Z') ||
+                             (*r->cmdline0 == '_'));
+            if (ok_start) {
+                /* 再配合 name 匹配更稳：/proc/status Name 就是 app_process 被截断
+                 * 的短名 "app_process"（11 字节，刚好没超过 TASK_COMM_LEN=15）*/
+                if (strncmp(r->name, "app_process", 11) == 0) return true;
+            }
+        }
+    }
+    return false;
+}
 
 static bool is_critical_by_name(const char *name)
 {
@@ -1021,6 +1181,20 @@ static void cleanup_script_leftovers(void)
             if (is_critical_by_cmdline(r->cmdline0)) r->critical = true;
         }
 
+        /* /proc/<pid>/exe 符号链接（目标路径）：配合 cmdline0 / status Name 综合
+         * 判断"这是不是 Android 应用 JVM 进程"，避免 GUARD_TASK=1 继承口径把
+         * App 子进程也当成用户二进制，造成 protect_n 50/52 虚高。*/
+        if (!r->critical && !r->is_kernel) {
+            char exepath[48];
+            snprintf(exepath, sizeof(exepath), "/proc/%d/exe", (int)pid);
+            ssize_t rl = readlink(exepath, r->exe_link, sizeof(r->exe_link) - 1);
+            if (rl < 0) rl = 0;
+            r->exe_link[rl] = 0;
+        }
+        if (!r->critical) {
+            r->is_jvm_app = looks_like_android_app_process(r);
+        }
+
         /* 主判据：GUARD_TASK 环境变量 */
         if (!r->critical)
             r->has_guard_task = read_environ_has_guard_task(pid);
@@ -1063,17 +1237,46 @@ static void cleanup_script_leftovers(void)
         return;
     }
 
-    /* ---- Phase B：白名单最小集合（仅"用户二进制正本"，去掉祖先链 protect 传播） ----
+    /* ---- Phase B：白名单最小集合（仅"真实用户原生二进制正本"）----
      * 用户明确口径：除了 Guard 守护程序本身 + 用户执行的二进制程序，其余全杀。
-     * 因此：
-     *   protect 对象只有一种：GUARD_TASK=1（脚本血统）且 !is_script_wrapper（不是
-     *   sh/su/toybox 等包装层）且 !critical 的进程 = 用户拉起的后台二进制。
+     * protect 条件（必须全部满足）：
+     *   ① !critical  —— 不跟系统底线白名单冲突
+     *   ② has_guard_task = 1 —— 脚本血统（环境变量由 Java 端 export 给脚本及其后代）
+     *   ③ !is_script_wrapper —— 不是 sh/su/toybox/toolbox…等脚本包装层
+     *   ④ !is_jvm_app —— 不是 app_process / dalvikvm / art 等 JVM 启动的 Android App
+     *                     （脚本里通过 am/app_process 拉起 App 组件时会继承 GUARD_TASK=1，
+     *                      这一类不算"用户二进制"，否则 protect_n 会虚高到 50/52，
+     *                      同时误让一堆 App 进程逃脱清理）
+     *   ⑤ 可选兜底：/proc/<pid>/exe 能读到且不是 /system/bin /system/xbin /vendor/bin
+     *                分区里的标准系统工具；这一步用来进一步把 toybox 多工具名、
+     *                am/pm/cmd/wm/settings 等 Java wrapper 的 shell 形态排除。
      *   不再做「子被保护 -> 父也保护」的祖先链传播。父 sh / 中间 su / 过渡 exec
      *   全部属于"其余"，严格模式下必须清理。 */
     for (size_t i = 0; i < count; i++) {
         ProcRecord *r = &procs[i];
         if (r->critical) continue;
-        if (r->has_guard_task && !r->is_script_wrapper) r->protect = true;
+        if (!r->has_guard_task) continue;
+        if (r->is_script_wrapper) continue;
+        if (r->is_jvm_app) continue;
+        /* 兜底：如果 exe 链接指向系统分区 (/system|/vendor|/product|/apex) 里的
+         * 已知工具路径，说明它其实是"被脚本继承了 GUARD_TASK 的系统工具短命
+         * 令"，不应当算用户二进制。典型：/system/bin/toybox、/system/bin/cmd、
+         * /system/bin/sh、/system/bin/app_process64 等。 */
+        if (r->exe_link[0]) {
+            static const char *const sys_prefixes[] = {
+                "/system/bin/", "/system/xbin/", "/vendor/bin/",
+                "/product/bin/", "/apex/com.android.", NULL
+            };
+            bool in_sys = false;
+            for (size_t k = 0; sys_prefixes[k]; k++) {
+                size_t pl = strlen(sys_prefixes[k]);
+                if (strncmp(r->exe_link, sys_prefixes[k], pl) == 0) {
+                    in_sys = true; break;
+                }
+            }
+            if (in_sys) continue;
+        }
+        r->protect = true;
     }
 
     /* ---- Phase C：打 kill_flag 种子（严格模式 = 除了 critical + protect 之外，
@@ -1209,7 +1412,8 @@ static void cleanup_script_leftovers(void)
         if (procs[idx].pid == my_pp) continue;     /* 保险：父进程（su） 不杀 */
         if (procs[idx].protect) {
             protect_raw_n++;
-            if (procs[idx].has_guard_task && !procs[idx].is_script_wrapper)
+            /* 严格口径：只有 Phase B 的"真实原生二进制正本"才算白名单 */
+            if (procs[idx].has_guard_task && !procs[idx].is_script_wrapper && !procs[idx].is_jvm_app)
                 protect_n++;
             continue;
         }
@@ -1220,6 +1424,30 @@ static void cleanup_script_leftovers(void)
     }
 
     (void)protect_raw_n;
+
+    /* 调试辅助：将前 10 个被白名单保护的进程 (pid,name,exe) 追加到日志里，
+     * 方便用户/我们目测 protect_n 虚高时"到底保护了谁"。*/
+    if (protect_n > 0) {
+        size_t shown = 0;
+        char line[2048];
+        int l = 0;
+        l += snprintf(line + l, sizeof(line) - (size_t)l, "[脚本清理] 白名单样本(至多10)：");
+        for (size_t i = 0; i < count && shown < 10 && (size_t)l < sizeof(line) - 32; i++) {
+            ProcRecord *pr = &procs[i];
+            if (!pr->protect) continue;
+            if (!(pr->has_guard_task && !pr->is_script_wrapper && !pr->is_jvm_app)) continue;
+            const char *ex = pr->exe_link[0] ? pr->exe_link : (pr->cmdline0[0] ? pr->cmdline0 : "-");
+            l += snprintf(line + l, sizeof(line) - (size_t)l,
+                          "%spid=%d name=%s exe=%s",
+                          shown ? " | " : "",
+                          (int)pr->pid, pr->name, ex);
+            shown++;
+        }
+        if (l > 0) {
+            l += snprintf(line + l, sizeof(line) - (size_t)l, "\n");
+            log_msg("%s", line);
+        }
+    }
 
     if (kill_n == 0) {
         log_msg("[脚本清理] 无可清理残留（白名单保护 %zu 个用户管理进程），跳过\n", protect_n);
@@ -1841,7 +2069,8 @@ int main(int argc, char **argv)
     else
         copy_str(config_file, sizeof(config_file), DEFAULT_CONFIG);
 
-    /* pidfile = ${config_file}.pid，Java 端 kill -0 精准确认存活 */
+    /* pidfile = ${config_file}.pid，Java 端 kill -0 精准确认存活；
+     * crash_file = ${config_file}.crash，崩溃信号处理器把现场写到这里 */
     {
         size_t cl = strlen(config_file);
         if (cl + strlen(".pid") + 1 <= sizeof(pid_file)) {
@@ -1849,7 +2078,16 @@ int main(int argc, char **argv)
             memcpy(pid_file + cl, ".pid", 5);
             atexit(remove_pidfile);
         }
+        if (cl + strlen(".crash") + 1 <= sizeof(crash_file)) {
+            memcpy(crash_file, config_file, cl);
+            memcpy(crash_file + cl, ".crash", 7);
+        }
     }
+
+    /* 致命信号先落盘再死：SIGSEGV/SIGBUS/SIGABRT/SIGFPE/SIGILL/SIGSYS/SIGTRAP。
+     * 必须装在 prctl/进入 main 逻辑之前，保证任何阶段（包括 ensure_config、
+     * log_msg fprintf 内部）的 FORTIFY abort 都能被正确捕获。*/
+    install_crash_handlers();
 
     /* 双保险改进程名：prctl 失败时退回到 argv[0] 覆盖（不依赖 libc 对 comm 传参） */
     if (prctl(PR_SET_NAME, "Guard", 0, 0, 0) < 0 && argv && argv[0]) {
