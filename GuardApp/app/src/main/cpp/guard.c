@@ -704,6 +704,8 @@ typedef struct {
     bool  has_guard_task;     // environ 中 GUARD_TASK=1
     bool  critical;           // 系统关键进程（绝不杀）
     bool  is_guard_self;      // Guard 应用自身的 UI/Service 进程（允许杀，只留守护）
+    bool  protect;            // 用户"管理类二进制"白名单（绝不杀），由 GUARD_TASK=1 且非包装层 + 祖先链传播
+    bool  is_script_wrapper;  // 进程名属于 shell/su/工具包装层（可作为清理种子）
     char  cmdline0[MAX_PKG];  // cmdline 首段（常等于包名或 "包名:service"）
     char  name[MAX_NAME];
 } ProcRecord;
@@ -730,6 +732,27 @@ static bool is_critical_by_name(const char *name)
             return true;
     }
 
+    return false;
+}
+
+/* 进程名是否属于"脚本包装层/Android 工具包"。仅这一类 GUARD_TASK=1 进程会被
+ * 当作"脚本残留种子"清理；其余 GUARD_TASK=1 进程（用户自定义二进制、
+ * 被管理员脚本后台的长期程序）一律进白名单，连祖先一起保护不杀，
+ * 避免把"通过脚本管理的二进制程序"被误清。*/
+static bool is_script_wrapper_name(const char *name)
+{
+    if (!name || !name[0])
+        return false;
+
+    static const char * const list[] = {
+        "sh","su","toybox","toolbox","busybox","bash","ash","dash",
+        "ksh","mksh","zsh","csh","tcsh",NULL
+    };
+
+    for (size_t i = 0; list[i]; i++) {
+        if (strcmp(name, list[i]) == 0)
+            return true;
+    }
     return false;
 }
 
@@ -936,6 +959,9 @@ static void cleanup_script_leftovers(void)
                               &r->ppid, &r->uid, &r->is_kernel))
             continue;
 
+        /* 分类：脚本包装层 vs 其他（用于之后黑白名单） */
+        r->is_script_wrapper = is_script_wrapper_name(r->name);
+
         /* 绝对不能碰的白名单 */
         if (pid == 1 || pid == 2 || pid == me || pid == my_pp) {
             r->critical = true;
@@ -968,7 +994,18 @@ static void cleanup_script_leftovers(void)
         return;
     }
 
-    /* ---- 2) 标记要清理的 PID 集合：种子 GUARD_TASK + 所有后代 ---- */
+    /* ---- 2) 保护白名单 + 清理种子 + 递归后代 ----
+     *   白名单保护（Phase B）：如果一个进程 GUARD_TASK=1 且它不是包装层，
+     *     说明它是用户通过脚本主动启动的"管理类二进制"（后台常驻程序），
+     *     这类绝不能杀；同时将其**祖先链**（沿 ppid 往上直到 init/找不到）
+     *     也一并打白标，避免杀父 sh 触发 SIGHUP 误伤。
+     *   清理种子（Phase C）：只有「GUARD_TASK=1 且 is_script_wrapper=1」的
+     *     进程 + 「is_guard_self=1」的 App UI 进程会被标记 kill_flag（守护自己
+     *     本来就是 critical=1，已经排除，不会被杀）。
+     *   后代扩散（Phase D）：BFS 方式：父被 kill 且子 !critical && !protect，
+     *     则子也被 kill，用来连带清包装层启动的短生命工具（cat/grep/sed 等），
+     *     但不会穿透到被 protect 的用户二进制后代。
+     * ---------------------------------------------------- */
     bool *kill_flag = calloc(count, sizeof(bool));
     if (!kill_flag) {
         log_msg("[脚本清理] 内存不足，跳过\n");
@@ -976,22 +1013,61 @@ static void cleanup_script_leftovers(void)
         return;
     }
 
-    /* 先标记种子：GUARD_TASK=1 进程 + Guard 应用自身（App UI/Service，只留守护） */
+    /* ---- Phase B：保护白名单（祖先链传播） ---- */
+    bool protect_changed;
+    do {
+        protect_changed = false;
+        for (size_t i = 0; i < count; i++) {
+            ProcRecord *r = &procs[i];
+            if (r->critical || r->protect)
+                continue;
+
+            /* 种子保护：GUARD_TASK=1 且 非脚本包装层 -> 用户二进制，保护 */
+            if (r->has_guard_task && !r->is_script_wrapper) {
+                r->protect = true;
+                protect_changed = true;
+                continue;
+            }
+
+            /* 传播保护：如果子进程被保护，则父进程也被保护（防 SIGHUP） */
+            pid_t my_pid = r->pid;
+            for (size_t k = 0; k < count; k++) {
+                if (procs[k].ppid == my_pid && procs[k].protect) {
+                    r->protect = true;
+                    protect_changed = true;
+                    break;
+                }
+            }
+        }
+    } while (protect_changed);
+
+    /* ---- Phase C：打 kill_flag 种子 ---- */
+    size_t seeds_wrapper = 0, seeds_app = 0;
     for (size_t i = 0; i < count; i++) {
         ProcRecord *r = &procs[i];
-        if (!r->critical && (r->has_guard_task || r->is_guard_self)) {
+        if (r->critical || r->protect)
+            continue;
+
+        if (r->is_guard_self) {
             kill_flag[i] = true;
+            seeds_app++;
+            continue;
+        }
+
+        if (r->has_guard_task && r->is_script_wrapper) {
+            kill_flag[i] = true;
+            seeds_wrapper++;
+            continue;
         }
     }
 
-    /* 再传递性标记后代（BFS 轮询式收敛，最多 N 轮，N<=count）
-     * 每一轮：若某个进程父被标记且自己不是 critical，则自己也标记 */
-    bool changed;
+    /* ---- Phase D：后代传递 kill_flag（父杀 -> 子杀，除非子被 protect/critical） ---- */
+    bool kill_changed;
     do {
-        changed = false;
+        kill_changed = false;
         for (size_t i = 0; i < count; i++) {
             ProcRecord *r = &procs[i];
-            if (kill_flag[i] || r->critical)
+            if (kill_flag[i] || r->critical || r->protect)
                 continue;
             pid_t ppid = r->ppid;
             if (ppid <= 0)
@@ -999,12 +1075,12 @@ static void cleanup_script_leftovers(void)
             for (size_t j = 0; j < count; j++) {
                 if (procs[j].pid == ppid && kill_flag[j]) {
                     kill_flag[i] = true;
-                    changed = true;
+                    kill_changed = true;
                     break;
                 }
             }
         }
-    } while (changed);
+    } while (kill_changed);
 
     /* ---- 3) 深度层级，按深度从大到小排序，保证先杀子再杀父 ---- */
     int  *depth  = calloc(count, sizeof(int));
@@ -1047,9 +1123,10 @@ static void cleanup_script_leftovers(void)
         order[j + 1] = t;
     }
 
-    /* ---- 4) 收集 kill 列表 ---- */
+    /* ---- 4) 收集 kill 列表，顺便统计保护数量 ---- */
     pid_t *kill_list = calloc(MAX_PROC, sizeof(pid_t));
     size_t kill_n = 0;
+    size_t protect_n = 0;
     if (!kill_list) {
         log_msg("[脚本清理] 内存不足，跳过\n");
         free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
@@ -1058,6 +1135,7 @@ static void cleanup_script_leftovers(void)
 
     for (size_t oi = 0; oi < count; oi++) {
         size_t idx = (size_t)order[oi];
+        if (procs[idx].protect) { protect_n++; continue; }
         if (!kill_flag[idx])
             continue;
         if (kill_n < MAX_PROC)
@@ -1065,11 +1143,13 @@ static void cleanup_script_leftovers(void)
     }
 
     if (kill_n == 0) {
+        log_msg("[脚本清理] 无可清理残留（白名单保护 %zu 个用户管理进程），跳过\n", protect_n);
         free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
         return;
     }
 
-    log_msg("[脚本清理] 命中 %zu 个残留进程，开始清理…\n", kill_n);
+    log_msg("[脚本清理] 清理种子：包装层 %zu / App UI %zu；白名单保护 %zu 个用户进程；将清理 %zu 个进程\n",
+            seeds_wrapper, seeds_app, protect_n, kill_n);
 
     /* ---- 5) SIGTERM（第一轮，温柔退出） ---- */
     for (size_t i = 0; i < kill_n; i++) {
