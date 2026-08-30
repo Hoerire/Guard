@@ -4,8 +4,8 @@ set -euo pipefail
 SDK=/data/user/work/android-sdk
 BT=$SDK/build-tools/35.0.0
 PLATFORM=$SDK/platforms/android-35/android.jar
-ROOT=/data/user/work/GuardApp
-BUILD=/data/user/work/build
+ROOT=/workspace/GuardApp
+BUILD=/workspace/build
 
 AAPT2=$BT/aapt2
 D8=$BT/d8
