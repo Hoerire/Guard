@@ -120,6 +120,14 @@ public class MainActivity extends Activity {
         if(bold) v.setTypeface(Typeface.DEFAULT,Typeface.BOLD); return v;
     }
 
+    // AlertDialog 自定义内容统一容器：固定 VERTICAL + 传入 dp padding，避免各弹窗贴边程度不一
+    LinearLayout dialogBox(int padDp){
+        LinearLayout l=new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setPadding(dp(padDp),dp(padDp),dp(padDp),dp(padDp));
+        return l;
+    }
+
     // ==================== UI ====================
     void buildUi(){
         root=new FrameLayout(this);
@@ -921,9 +929,7 @@ public class MainActivity extends Activity {
     }
     void showPrinciple(){
         ScrollView sc=new ScrollView(this);
-        LinearLayout box=new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(22),dp(14),dp(22),dp(18));
+        LinearLayout box=dialogBox(14);
         sc.addView(box);
 
         box.addView(principleHeader("一、核心思路"));
@@ -952,6 +958,7 @@ public class MainActivity extends Activity {
         box.addView(principleItem("运行日志实时展示，支持一键导出到存储卡根目录（root 写入绕过分区存储限制），便于排查与反馈。"));
 
         new AlertDialog.Builder(this)
+            .setTitle("工作原理")
             .setView(sc)
             .setPositiveButton("已了解",null)
             .show();
@@ -1138,19 +1145,18 @@ public class MainActivity extends Activity {
 
     // 点开脚本：弹出运行确认，带「使用 SU 权限」复选框
     void runScriptDialog(final File f){
-        LinearLayout box=new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(6),dp(2),dp(6),dp(2));
+        LinearLayout box=dialogBox(18);
         TextView info=tv(f.getAbsolutePath(),13,SUBTEXT,false);
         info.setTypeface(Typeface.MONOSPACE);
+        info.setPadding(0,0,0,dp(8));
         box.addView(info);
         TextView hint=tv("运行时会弹出实时窗口：程序出现「请输入/选择」等提示时，在底部输入框输入数字或内容后点「发送」即可。",12,SUBTEXT,false);
-        hint.setLineSpacing(dp(2),1f); hint.setPadding(0,dp(10),0,dp(4));
+        hint.setLineSpacing(dp(2),1f); hint.setPadding(0,0,0,dp(12));
         box.addView(hint);
         final CheckBox su=new CheckBox(this);
         su.setText("使用 SU 权限运行（root）"); su.setChecked(true);
         su.setTextColor(TEXT);
-        su.setButtonTintList(ColorStateList.valueOf(0xFF2FA66F));
+        su.setButtonTintList(ColorStateList.valueOf(PRIMARY));
         box.addView(su);
         new AlertDialog.Builder(this)
             .setTitle("运行脚本 · "+f.getName())
@@ -1165,9 +1171,7 @@ public class MainActivity extends Activity {
         appendLog("[脚本] "+(useSu?"SU":"普通")+"运行："+f.getAbsolutePath()+(binary?"（检测为二进制可执行文件，直接执行）":""));
 
         // ===== 交互式运行窗口：顶部实时输出 + 底部输入框（可随时发送数字/内容给进程）=====
-        LinearLayout box=new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(dp(4),dp(2),dp(4),dp(2));
+        LinearLayout box=dialogBox(14);
 
         ScrollView sc=new ScrollView(this);
         sc.setVerticalScrollBarEnabled(true);
@@ -1181,7 +1185,6 @@ public class MainActivity extends Activity {
         LinearLayout inputRow=new LinearLayout(this);
         inputRow.setOrientation(LinearLayout.HORIZONTAL);
         inputRow.setGravity(Gravity.CENTER_VERTICAL);
-        inputRow.setPadding(0,dp(8),0,0);
         final EditText input=new EditText(this);
         input.setHint("输入数字或内容，点「发送」"); input.setTextSize(13);
         input.setHintTextColor(SUBTEXT); input.setTextColor(TEXT);
@@ -1194,9 +1197,9 @@ public class MainActivity extends Activity {
         Button send=new Button(this);
         send.setText("发送"); send.setTextColor(0xFFFFFFFF); send.setTextSize(13);
         send.setAllCaps(false); send.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
-        send.setBackground(round(0xFF2FA66F,dp(12)));
+        send.setBackground(round(PRIMARY,dp(12)));
         LinearLayout.LayoutParams blp=new LinearLayout.LayoutParams(dp(72),dp(42));
-        blp.setMargins(dp(8),0,0,0);
+        blp.setMargins(dp(8),dp(12),0,0);
         inputRow.addView(send,blp);
         box.addView(inputRow);
 
@@ -1221,10 +1224,9 @@ public class MainActivity extends Activity {
         input.setOnEditorActionListener((v,a,ev)->{ if(a==EditorInfo.IME_ACTION_SEND){ sendInput.run(); return true; } return false; });
 
         final AlertDialog dlg=new AlertDialog.Builder(this)
-            .setTitle("运行 · "+f.getName())
+            .setTitle("运行 · "+f.getName()+"（可随时关闭窗口取消）")
             .setView(box)
-            .setPositiveButton("完成",null)
-            .setCancelable(false)
+            .setPositiveButton("关闭窗口",null)
             .create();
         dlg.setOnDismissListener(d->{ userClosed[0]=true; if(proc[0]!=null){ try{ proc[0].destroy(); }catch(Exception ignored){} } });
         dlg.show();
@@ -1341,21 +1343,6 @@ public class MainActivity extends Activity {
             in.close();
             return n==4&&b[0]==0x7F&&b[1]=='E'&&b[2]=='L'&&b[3]=='F';
         }catch(Exception e){ return false; }
-    }
-
-    void showScriptResult(String name,int code,String out){
-        ScrollView sc=new ScrollView(this);
-        TextView tv=new TextView(this);
-        tv.setText("退出码："+code+"\n\n"+(out==null||out.isEmpty()?"（无输出）":out));
-        tv.setTextSize(13); tv.setTypeface(Typeface.MONOSPACE);
-        tv.setTextColor(TEXT);
-        tv.setPadding(dp(18),dp(12),dp(18),dp(12));
-        sc.addView(tv);
-        new AlertDialog.Builder(this)
-            .setTitle(name)
-            .setView(sc)
-            .setPositiveButton("关闭",null)
-            .show();
     }
 
     // ===== 轻量终端（交互式 root shell）=====
