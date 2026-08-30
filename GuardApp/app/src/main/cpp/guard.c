@@ -57,6 +57,10 @@ static Config cfg;
 static AppState states[MAX_FREEZE];
 static size_t state_count;
 static volatile sig_atomic_t running = 1;
+/* 立即清理标志：脚本执行完毕 Java 端通过 kill -USR1 <守护PID> 触发；
+ * 主循环 poll 返回/中断后检查此标志，为 1 时立即跑一次 cleanup_script_leftovers()
+ *，不再必须等切到目标应用才清包装层。 */
+static volatile sig_atomic_t cleanup_pending = 0;
 static bool active;
 static char current_fg[MAX_PKG];
 static struct stat cfg_stat;
@@ -67,7 +71,7 @@ static void remove_pidfile(void);    /* forward decl：供 signal_handler / atex
 
 static void signal_handler(int sig)
 {
-    (void)sig;
+    if (sig == SIGUSR1) { cleanup_pending = 1; return; }
     running = 0;
     remove_pidfile();
 }
@@ -1140,10 +1144,15 @@ static void cleanup_script_leftovers(void)
         order[j + 1] = t;
     }
 
-    /* ---- 4) 收集 kill 列表，顺便统计保护数量 ---- */
+    /* ---- 4) 收集 kill 列表，顺便统计保护数量 ----
+     * 注意 protect_n 口径：只数"真正的用户二进制白名单正本"（GUARD_TASK=1 且
+     * 非脚本包装层）。祖先链传播得到的 protect 副本/App UI/critical 不算在内，
+     * 否则会把同一次清理的保护数虚高，并随调用次数/脚本累积显得"越来越多"，
+     * 对用户判断自己后台二进制是否都被保护造成误导。 */
     pid_t *kill_list = calloc(MAX_PROC, sizeof(pid_t));
     size_t kill_n = 0;
     size_t protect_n = 0;
+    size_t protect_raw_n = 0;
     if (!kill_list) {
         log_msg("[脚本清理] 内存不足，跳过\n");
         free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
@@ -1152,12 +1161,19 @@ static void cleanup_script_leftovers(void)
 
     for (size_t oi = 0; oi < count; oi++) {
         size_t idx = (size_t)order[oi];
-        if (procs[idx].protect) { protect_n++; continue; }
+        if (procs[idx].protect) {
+            protect_raw_n++;
+            if (procs[idx].has_guard_task && !procs[idx].is_script_wrapper)
+                protect_n++;
+            continue;
+        }
         if (!kill_flag[idx])
             continue;
         if (kill_n < MAX_PROC)
             kill_list[kill_n++] = procs[idx].pid;
     }
+
+    (void)protect_raw_n;
 
     if (kill_n == 0) {
         log_msg("[脚本清理] 无可清理残留（白名单保护 %zu 个用户管理进程），跳过\n", protect_n);
@@ -1538,6 +1554,14 @@ static bool monitor_logcat(void)
                 used = 0;
             }
         }
+
+        /* 每次读一批事件后，检查是否有"Java 端请求立即清理"（SIGUSR1）：
+         * 脚本执行完毕需要立刻清包装层，不再必须等到切到目标应用触发。 */
+        if (cleanup_pending) {
+            cleanup_pending = 0;
+            log_msg("[脚本清理] 收到外部清理请求，立即清理脚本包装层\n");
+            cleanup_script_leftovers();
+        }
     }
 
     close(fd);
@@ -1792,6 +1816,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGUSR1, signal_handler);
 
     memset(states, 0, sizeof(states));
     state_count = 0;

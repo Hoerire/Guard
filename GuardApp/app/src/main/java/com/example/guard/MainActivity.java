@@ -1987,9 +1987,13 @@ public class MainActivity extends Activity {
                 }
                 termProc=null; termIn=null;
                 runOnUiThread(()->appendTerm("$ 终端已退出\n"));
+                // 终端退出：如果是从 root shell 跑过脚本，后代都会带 GUARD_TASK=1
+                // 立即让守护做一次血统级清理，避免留下 su/sh 包装层。
+                if(rootGranted) triggerGuardCleanup(false);
             }catch(Exception e){
                 runOnUiThread(()->appendTerm("[错误] 启动终端失败："+e.getMessage()+"\n"));
                 termProc=null; termIn=null;
+                if(rootGranted) triggerGuardCleanup(false);
             }
         }).start();
     }
@@ -2127,9 +2131,36 @@ public class MainActivity extends Activity {
             }
             if(report.length()==0) appendLog("[脚本] 已清理所有遗留进程（无残留）");
             else appendLog("[脚本] 已清理所有遗留进程"+report);
+            // 再触发一次 C 守护做"血统级深度清理"：所有 GUARD_TASK=1 的脚本包装层/短生命工具链
+            // 会被一次性扫出来清理掉，不再必须等到进入目标应用才触发。
+            // 日志会走 guard.log→LogTailer 实时桥到 UI 文本框，方便直接看清理结果。
+            triggerGuardCleanup(/*fromScript=*/true);
         }catch(Exception e){
             appendLog("[脚本] 清理遗留进程失败："+e.getMessage());
         }
+    }
+
+    // 请求 Guard 守护立即执行一次「脚本包装层深度清理」。
+    // 实现方式：读 pidfile → 校验 Name=Guard → kill -USR1 <守护PID>；
+    // 守护进程 SIGUSR1 处理器会把 cleanup_pending 置 1，在下一次 poll 返回后
+    // 立即跑 cleanup_script_leftovers()。
+    void triggerGuardCleanup(final boolean fromScript){
+        new Thread(()->{
+            try{
+                if(!rootGranted) return;
+                int gp=findGuardPid();
+                if(gp<=1){ return; } // 守护未运行，无需触发
+                String cmd="Name=$(cat /proc/"+gp+"/status 2>/dev/null | grep '^Name:' | awk '{print $2}'); "+
+                           "if [ \"$Name\" = \""+GUARD_NAME+"\" ]; then kill -USR1 "+gp+"; exit $?; fi; exit 2";
+                Res r=suExec(cmd);
+                // 触发结果不需要写 UI 日志；清理完成后 guard.log 会自动显示：
+                // 「[脚本清理] 收到外部清理请求，立即清理脚本包装层」+ 后续清理/复核日志。
+                // 若调用是"守护未运行/进程名不匹配"的失败则静默忽略，避免刷屏。
+                if(fromScript && r.code!=0 && r.code!=2){
+                    // 只有在"明确已请求但 kill 失败"时提示一下，大多数场景失败等价于守护未存活，可忽略
+                }
+            }catch(Exception ignored){}
+        }).start();
     }
 
     static class Res{ int code; String out; Res(int code,String out){ this.code=code; this.out=out; } }
