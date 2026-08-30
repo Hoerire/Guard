@@ -728,7 +728,12 @@ static bool is_critical_by_name(const char *name)
         "zygote32", "system_server", "surfaceflinger",
         "audioserver", "cameraserver", "drm",
         "installd", "keystore", "storaged", "logd",
-        "logcat", NULL
+        "logcat",
+        /* Android 核心应用/系统 UI：进程名截断到 15 字节时也尽量按短名匹配 */
+        "systemui", "com.android.systemui", /* 大部分 ROM 上 /proc/<pid>/status Name: 是 "com.android.sy"，见 cmdline 判定 */
+        "android.process.acore",
+        "android.process.media",
+        NULL
     };
 
     for (size_t i = 0; list[i]; i++) {
@@ -736,6 +741,40 @@ static bool is_critical_by_name(const char *name)
             return true;
     }
 
+    return false;
+}
+
+/* 基于 cmdline0（包名）判断"绝对不能碰"的核心系统进程。
+ * 因为 /proc/<pid>/status Name 最长 15 字节（TASK_COMM_LEN），SystemUI / 系统 App
+ * 的长包名会被截断（如 com.android.systemui → com.android.sy），单靠 name 匹配
+ * 是漏网的；之前误引入 "uid>=10000 全部送 kill" 就把 SystemUI 一起杀掉了，
+ * 导致用户反馈"系统界面直接被重启"。这里按完整 cmdline 前缀兜底。 */
+static bool is_critical_by_cmdline(const char *cmd)
+{
+    if (!cmd || !cmd[0]) return false;
+
+    /* 前缀式匹配（包含主进程与 :xxx 子进程，例如 com.android.systemui:screenshot） */
+    static const char * const prefix_list[] = {
+        "com.android.systemui",          /* SystemUI（状态栏/导航栏/锁屏），杀了会重启并报 FORTIFY */
+        "com.android.settings",          /* 系统设置 */
+        "com.android.launcher",          /* 桌面（AOSP 原生 Launcher3 常见前缀） */
+        "com.oplus.launcher",            /* Oplus/ColorOS 桌面 */
+        "com.coloros.launcher",          /* 旧 ColorOS 桌面 */
+        "android.process.acore",         /* 联系人/电话核心 */
+        "android.process.media",         /* 媒体扫描/存储提供器 */
+        "com.android.providers.",        /* 所有系统 Provider */
+        "com.android.phone",             /* 电话进程 */
+        "com.android.server.telecom",    /* 电信服务 */
+        NULL
+    };
+    for (size_t i = 0; prefix_list[i]; i++) {
+        size_t pl = strlen(prefix_list[i]);
+        if (strncmp(cmd, prefix_list[i], pl) == 0) {
+            /* 要么正好等于前缀长度，要么下一个字符是子进程分隔符 ':' 或 '/' */
+            char next = cmd[pl];
+            if (next == '\0' || next == ':') return true;
+        }
+    }
     return false;
 }
 
@@ -975,6 +1014,13 @@ static void cleanup_script_leftovers(void)
             r->critical = true;
         }
 
+        /* cmdline 首段读出来，既用于 is_guard_self 也用于关键系统进程兜底匹配
+         * （SystemUI 等长包名 Name 字段会被截断，只能靠 cmdline 判断） */
+        if (!r->critical) {
+            (void)read_cmdline_first(pid, r->cmdline0, sizeof(r->cmdline0));
+            if (is_critical_by_cmdline(r->cmdline0)) r->critical = true;
+        }
+
         /* 主判据：GUARD_TASK 环境变量 */
         if (!r->critical)
             r->has_guard_task = read_environ_has_guard_task(pid);
@@ -982,7 +1028,7 @@ static void cleanup_script_leftovers(void)
         /* 次判据：Guard 应用自身的 UI / Service 进程（包名或 app_process 主进程）
          * 用户明确要求：触发目标应用时允许连自身 App 一起关掉，只留守护 */
         if (!r->critical) {
-            (void)read_cmdline_first(pid, r->cmdline0, sizeof(r->cmdline0));
+            /* cmdline0 上面已填充，无需重读 */
             r->is_guard_self = is_guard_app_process(cfg.appuid,
                                                     r->uid,
                                                     r->name,
@@ -1030,14 +1076,23 @@ static void cleanup_script_leftovers(void)
         if (r->has_guard_task && !r->is_script_wrapper) r->protect = true;
     }
 
-    /* ---- Phase C：打 kill_flag 种子（严格模式 = 除了 critical + protect 全杀光） ----
-     * 种子优先级：
-     *   (a) is_guard_self = 1            → Guard 应用 UI/Service/子进程（只留守护二进制）
-     *   (b) GUARD_TASK=1 && wrapper = 1  → 脚本血统下的 su/sh/toybox/toolbox…等包装层
+    /* ---- Phase C：打 kill_flag 种子（严格模式 = 除了 critical + protect 之外，
+     *   只杀"明确属于脚本/App 血统"的进程）。
+     *
+     *  ⚠️ 已移除旧方案 (d)「uid>=AID_APP (10000) 全部作兜底种子」：
+     *  /proc/<pid>/status 的 Name 字段最长 15 字节，像 com.android.systemui 会被
+     *  截断成 "com.android.sy"，旧的 is_critical_by_name() 仅按短名匹配，导致
+     *  SystemUI/Settings/Launcher 等长包名系统 App 从 critical 网里漏掉，再叠加
+     *  10000 兜底就会连带一起 kill，出现用户反馈"系统界面直接被重启"，且 Bionic
+     *  FORTIFY 会在 SystemUI 被杀时打印 pthread_mutex_lock on destroyed mutex。
+     *
+     *  现在种子只保留血统明确的 3 类：
+     *   (a) is_guard_self = 1              → Guard 应用 UI/Service/子进程（只留守护二进制）
+     *   (b) GUARD_TASK=1 && wrapper = 1    → 脚本血统下的 su/sh/toybox/toolbox…包装层
      *   (c) GUARD_TASK=1 && !wrapper && !protect → Phase B 异常兜底（理论不会发生）
-     *   (d) uid >= AID_APP (10000) 且 !critical 且 !protect
-     *       → App 沙箱 UID 区间内其余进程，作为"脚本/App 衍生残余"兜底种子
-     * Phase D 会把上述种子向下扩散到所有后代，形成一次性清理列表。 */
+     *
+     *  SystemUI 等关键系统进程现在通过 is_critical_by_cmdline() 读完整 cmdline[0]
+     *  前缀来兜底标记 critical，不会再进入种子或扩散下游。 */
     size_t seeds_wrapper = 0, seeds_app = 0, seeds_extra = 0;
     for (size_t i = 0; i < count; i++) {
         ProcRecord *r = &procs[i];
@@ -1063,14 +1118,14 @@ static void cleanup_script_leftovers(void)
             continue;
         }
 
-        if ((int)r->uid >= 10000) {
-            kill_flag[i] = true;
-            seeds_extra++;
-            continue;
-        }
+        /* 不再按 uid>=10000 范围兜底，避免误伤 SystemUI/Launcher 等系统 App */
     }
     (void)seeds_extra;
-    /* ---- Phase D：后代传递 kill_flag（父杀 -> 子杀，除非子被 protect/critical） ---- */
+    /* ---- Phase D：后代传递 kill_flag（父杀 -> 子杀，除非子被 protect/critical）。
+     *   重要边界：如果父进程是 critical（例如守护自己的父进程 su、或是 zygote /
+     *   system_server 等系统进程），父即便被某个 seed 误命中 kill_flag 也不会真
+     *   的执行 kill，所以这里"父 kill_flag=true → 子继承"时要额外验证父并不是
+     *   critical，避免以 critical 作"扩散锚点"把整个系统树吞进来。*/
     bool kill_changed;
     do {
         kill_changed = false;
@@ -1082,7 +1137,7 @@ static void cleanup_script_leftovers(void)
             if (ppid <= 0)
                 continue;
             for (size_t j = 0; j < count; j++) {
-                if (procs[j].pid == ppid && kill_flag[j]) {
+                if (procs[j].pid == ppid && kill_flag[j] && !procs[j].critical) {
                     kill_flag[i] = true;
                     kill_changed = true;
                     break;
@@ -1149,6 +1204,9 @@ static void cleanup_script_leftovers(void)
 
     for (size_t oi = 0; oi < count; oi++) {
         size_t idx = (size_t)order[oi];
+        if (procs[idx].critical) continue;         /* 绝对底线：守护/系统/关键进程即便误命中 flag 也不入 kill_list */
+        if (procs[idx].pid == me) continue;        /* 保险：守护 PID 不杀 */
+        if (procs[idx].pid == my_pp) continue;     /* 保险：父进程（su） 不杀 */
         if (procs[idx].protect) {
             protect_raw_n++;
             if (procs[idx].has_guard_task && !procs[idx].is_script_wrapper)
