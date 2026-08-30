@@ -496,7 +496,7 @@ public class MainActivity extends Activity {
                 ArrayList<ApplicationInfo> apps=new ArrayList<>(pm.getInstalledApplications(0));
                 apps.sort((a,b)->pm.getApplicationLabel(a).toString().compareToIgnoreCase(pm.getApplicationLabel(b).toString()));
                 for(ApplicationInfo ai:apps){
-                    if(ai.packageName.equals(getPackageName())) continue;
+                    // Guard 自身允许加入列表（可作为「禁用应用」隐藏自身），后续在 UI 层屏蔽「目标应用」模式勾选
                     String label=pm.getApplicationLabel(ai).toString();
                     Drawable icon=ai.loadIcon(pm);
                     boolean system=(ai.flags&ApplicationInfo.FLAG_SYSTEM)!=0;
@@ -515,7 +515,6 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    // 读取应用私有目录 config.txt（无需 root）
     void applyConfigFromFile(){
         try{
             if(!cfgFile.exists()) return;
@@ -528,13 +527,20 @@ public class MainActivity extends Activity {
                 else if(s.startsWith("freeze:")) freezes.add(s.substring(7).trim());
             }
             r.close();
+            // —— 互斥防线（文件加载阶段）：同一 pkg 同时在两边时，目标优先，从 freezes 中剔除 ——
+            int overlap=0;
+            for(String p:new HashSet<>(freezes)){
+                if(targets.contains(p)){ freezes.remove(p); overlap++; }
+            }
+            // Guard 自身不允许作为触发目标（作为前台应用触发逻辑无意义）
+            if(targets.remove(getPackageName())) overlap++;
             if(targets.isEmpty()&&freezes.isEmpty()) return;
             for(AppInfo a: allApps){
                 a.checkedT=targets.contains(a.pkg);
                 a.checkedF=freezes.contains(a.pkg);
-                if(a.checkedT) a.checkedF=false; // 互斥：目标优先，同一应用不能同时禁用
             }
-            appendLog("[系统] 已识别配置：目标 "+targets.size()+"，禁用 "+freezes.size());
+            String overlapHint=overlap>0? "（冲突 "+overlap+" 条已按规则清理）":"";
+            appendLog("[系统] 已识别配置：目标 "+targets.size()+"，禁用 "+freezes.size()+overlapHint);
         }catch(Exception ignored){}
     }
 
@@ -587,16 +593,30 @@ public class MainActivity extends Activity {
         final CheckBox cb=new CheckBox(this);
         cb.setButtonTintList(ColorStateList.valueOf(PRIMARY));
         if(mode==0) cb.setChecked(info.checkedT); else cb.setChecked(info.checkedF);
+
+        final boolean isSelfPkg=info.pkg.equals(getPackageName());
+        if(isSelfPkg && mode==0){
+            // 本应用不可作为「目标应用」触发源，禁用勾选 + 灰色提示
+            cb.setEnabled(false);
+            texts.addView(tv("（本应用不可作为触发目标，可加入「禁用应用」隐藏自身）",11,0xFF99A4B6,false));
+        }
+
         cb.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener(){
             @Override public void onCheckedChanged(CompoundButton v,boolean is){
+                //  Guard 自身 + 目标模式：不允许任何操作（上面已禁用 CheckBox，这里再兜底）
+                if(is && isSelfPkg && mode==0){
+                    v.setChecked(false);
+                    showFloat(info.label+" 不可作为触发目标");
+                    return;
+                }
                 if(is){
-                    // 互斥：同一应用不能同时是「目标应用」和「禁用应用」
+                    // 互斥：同一应用不能同时是「目标应用」和「禁用应用」—— 新勾选的一侧优先，另一侧自动移除
                     if(mode==0&&info.checkedF){
                         info.checkedF=false;
-                        appendLog("[配置] "+info.label+" 已从「禁用应用」移除（互斥）");
+                        appendLog("[配置] "+info.label+" 已自动从「禁用应用」移除（与目标应用互斥）");
                     }else if(mode==1&&info.checkedT){
                         info.checkedT=false;
-                        appendLog("[配置] "+info.label+" 已从「目标应用」移除（互斥）");
+                        appendLog("[配置] "+info.label+" 已自动从「目标应用」移除（与禁用应用互斥）");
                     }
                 }
                 if(mode==0) info.checkedT=is; else info.checkedF=is;
@@ -793,11 +813,18 @@ public class MainActivity extends Activity {
     // ==================== 配置 ====================
     // 勾选应用即自动写入配置（静默，避免频繁刷日志）
     void writeConfig(){
-        ArrayList<String> t=new ArrayList<>(), f=new ArrayList<>();
+        // —— 互斥防线（写入前最终校验）：内存中同时处于 T+F 状态的应用，强制目标优先 ——
+        HashSet<String> tSet=new HashSet<>(), fSet=new HashSet<>();
         for(AppInfo a: allApps){
-            if(a.checkedT)t.add(a.pkg);
-            if(a.checkedF)f.add(a.pkg);
+            if(a.checkedT){ tSet.add(a.pkg); a.checkedF=false; }
         }
+        // Guard 自身不得作为目标应用写入（兜底，理论上 UI 层已拦截）
+        tSet.remove(getPackageName());
+        for(AppInfo a: allApps){
+            if(a.checkedF) fSet.add(a.pkg);
+        }
+        ArrayList<String> t=new ArrayList<>(tSet);
+        ArrayList<String> f=new ArrayList<>(fSet);
         StringBuilder s=new StringBuilder(); s.append("# Guard config\ninterval:2\n\n");
         for(String p:t)s.append("target:").append(p).append('\n'); s.append('\n');
         for(String p:f)s.append("freeze:").append(p).append('\n');
