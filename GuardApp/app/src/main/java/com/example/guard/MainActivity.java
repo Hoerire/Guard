@@ -53,7 +53,10 @@ public class MainActivity extends Activity {
     View statusDot;
     Button toggleBtn;
     FrameLayout root;
-    ScrollView homeScroll, pickerScroll, logScroll;
+    // 主页改成"固定布局容器"（非 ScrollView）以禁止整页上下滑动，保持视觉一致；
+    // 只有日志框内部独立滚动，且支持长按选中文本复制。
+    FrameLayout homeWrap;
+    ScrollView pickerScroll, logScroll;
     LinearLayout homeContent, pickerContent, listBox;
     EditText search;
     Switch sysSwitch;
@@ -162,10 +165,16 @@ public class MainActivity extends Activity {
         ftp.bottomMargin=dp(96);
         root.addView(floatToast,ftp);
 
-        homeScroll=new ScrollView(this);
+        // 主页：固定布局（不允许整页上下滑），各块按权重分配：
+        //   ① 状态栏 + 开关 + 菜单（固定高度，按内容包高）
+        //   ② 日志框（0 高 + weight=1，占剩余空间，内部独立滚动）
+        //   ③ 底部：工作原理 + Bug 反馈（靠近日志，不上不下居中）
+        homeWrap=new FrameLayout(this);
         homeContent=new LinearLayout(this); homeContent.setOrientation(LinearLayout.VERTICAL);
-        homeContent.setPadding(dp(20),dp(12),dp(20),dp(32));
-        homeScroll.addView(homeContent); root.addView(homeScroll);
+        homeContent.setPadding(dp(20),dp(12),dp(20),dp(10));
+        FrameLayout.LayoutParams hclp=new FrameLayout.LayoutParams(-1,-1);
+        homeWrap.addView(homeContent,hclp);
+        root.addView(homeWrap);
 
         pickerContent=new LinearLayout(this); pickerContent.setOrientation(LinearLayout.VERTICAL);
         buildPicker();
@@ -245,11 +254,12 @@ public class MainActivity extends Activity {
         homeContent.addView(menuCard("禁用应用","进入目标后将被禁用的应用",1,hidePill=new TextView(this),0xFF8B6BE8,0xFFF0E9FF,R.drawable.ic_snow));
         homeContent.addView(menuCard("脚本管理","轻量终端 · 系统环境执行脚本",2,scriptPill=new TextView(this),0xFF2FA66F,0xFFE5F6EC,R.drawable.ic_terminal));
 
-        // ===== 底部：运行日志框 =====
+        // ===== 底部：运行日志框（0 高 + layout_weight=1，占满剩余空间；只让内部 logScroll 滚动） =====
         LinearLayout logCard=glassCard();
-        LinearLayout.LayoutParams lclp=new LinearLayout.LayoutParams(-1,-2);
-        lclp.setMargins(0,dp(16),0,0);
-        logCard.setPadding(dp(14),dp(12),dp(14),dp(12));
+        LinearLayout.LayoutParams lclp=new LinearLayout.LayoutParams(-1,0,1f);
+        lclp.setMargins(0,dp(12),0,0);
+        logCard.setPadding(dp(14),dp(10),dp(14),dp(10));
+        logCard.setOrientation(LinearLayout.VERTICAL);
         homeContent.addView(logCard,lclp);
 
         LinearLayout logHeader=new LinearLayout(this);
@@ -276,35 +286,29 @@ public class MainActivity extends Activity {
         logView=new TextView(this);
         logView.setTextSize(12); logView.setTextColor(SUBTEXT);
         logView.setTypeface(Typeface.MONOSPACE);
-        logView.setPadding(dp(2),dp(8),dp(2),dp(4));
-        logScroll.addView(logView);
-        LinearLayout.LayoutParams lslp=new LinearLayout.LayoutParams(-1,dp(190));
+        logView.setPadding(dp(6),dp(8),dp(6),dp(8));
+        // 允许长按选中文本并复制（同时保持不拦截父容器滚动——这里父容器已不滑动）
+        logView.setTextIsSelectable(true);
+        logView.setFocusable(true);
+        logView.setFocusableInTouchMode(true);
+        logView.setLongClickable(true);
+        // 减少选中文本时额外的底部空白跳动
+        logView.setIncludeFontPadding(false);
+        logScroll.addView(logView,new ScrollView.LayoutParams(-1,-2));
+        LinearLayout.LayoutParams lslp=new LinearLayout.LayoutParams(-1,0,1f);
         lslp.setMargins(0,dp(4),0,0);
         logCard.addView(logScroll,lslp);
-        // 修复与主页外层 ScrollView 的滚动冲突：日志框内触摸时，禁止外层拦截，使内部可独立滚动
-        logScroll.setOnTouchListener((v,e)->{
-            switch(e.getActionMasked()){
-                case MotionEvent.ACTION_DOWN:
-                    homeScroll.requestDisallowInterceptTouchEvent(true);
-                    break;
-                case MotionEvent.ACTION_UP:
-                case MotionEvent.ACTION_CANCEL:
-                    homeScroll.requestDisallowInterceptTouchEvent(false);
-                    break;
-            }
-            return false;
-        });
         // 跟踪是否滚到底部：滚到底部时新日志自动跟随，向上翻阅时暂停跟随
         logScroll.setOnScrollChangeListener((v,scrollX,scrollY,oldX,oldY)->{
             View child=logScroll.getChildAt(0);
             logAtBottom=child==null||(scrollY+logScroll.getHeight())>=child.getHeight()-1;
         });
 
-        // 底部：工作原理 + Bug 反馈
+        // 底部：工作原理 + Bug 反馈（与日志底部贴得更近，顶距从 14→6dp）
         LinearLayout bottomRow=new LinearLayout(this);
         bottomRow.setOrientation(LinearLayout.HORIZONTAL);
         bottomRow.setGravity(Gravity.CENTER);
-        bottomRow.setPadding(0,dp(14),0,dp(8));
+        bottomRow.setPadding(0,dp(6),0,dp(2));
         homeContent.addView(bottomRow);
 
         TextView principle=new TextView(this);
@@ -448,14 +452,14 @@ public class MainActivity extends Activity {
         pickerContent.setVisibility(View.GONE);
         scriptContent.setVisibility(View.GONE);
         terminalContent.setVisibility(View.GONE);
-        homeScroll.setVisibility(View.VISIBLE);
+        homeWrap.setVisibility(View.VISIBLE);
         updateHomeCounts();
         updateStatus();
     }
     void showPicker(int m){
         mode=m;
         pickerTitle.setText(m==0?"目标应用":"禁用应用");
-        homeScroll.setVisibility(View.GONE);
+        homeWrap.setVisibility(View.GONE);
         scriptContent.setVisibility(View.GONE);
         terminalContent.setVisibility(View.GONE);
         pickerContent.setVisibility(View.VISIBLE);
@@ -463,14 +467,14 @@ public class MainActivity extends Activity {
         rebuildList();
     }
     void showScripts(){
-        homeScroll.setVisibility(View.GONE);
+        homeWrap.setVisibility(View.GONE);
         pickerContent.setVisibility(View.GONE);
         terminalContent.setVisibility(View.GONE);
         scriptContent.setVisibility(View.VISIBLE);
         refreshFileList();
     }
     void openTerminal(String runScript){
-        homeScroll.setVisibility(View.GONE);
+        homeWrap.setVisibility(View.GONE);
         pickerContent.setVisibility(View.GONE);
         scriptContent.setVisibility(View.GONE);
         terminalContent.setVisibility(View.VISIBLE);
