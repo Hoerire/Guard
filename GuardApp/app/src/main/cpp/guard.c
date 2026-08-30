@@ -1017,57 +1017,32 @@ static void cleanup_script_leftovers(void)
         return;
     }
 
-    /* ---- Phase B：保护白名单（祖先链传播） ---- */
-    bool protect_changed;
-    do {
-        protect_changed = false;
-        for (size_t i = 0; i < count; i++) {
-            ProcRecord *r = &procs[i];
-            if (r->critical || r->protect)
-                continue;
-
-            /* 种子保护：GUARD_TASK=1 且 非脚本包装层 -> 用户二进制，保护 */
-            if (r->has_guard_task && !r->is_script_wrapper) {
-                r->protect = true;
-                protect_changed = true;
-                continue;
-            }
-
-            /* 传播保护：如果子进程被保护，则父进程也被保护（防 SIGHUP） */
-            pid_t my_pid = r->pid;
-            for (size_t k = 0; k < count; k++) {
-                if (procs[k].ppid == my_pid && procs[k].protect) {
-                    r->protect = true;
-                    protect_changed = true;
-                    break;
-                }
-            }
-        }
-    } while (protect_changed);
-
-    /* ---- Phase C：打 kill_flag 种子 ----
-     * 兜底特殊规则（解决"包装层因有保护子孙被 protect 传播而清不干净"）：
-     *   若一个进程同时满足「GUARD_TASK=1（脚本血统）+ is_script_wrapper=1
-     *   （属于 shell/su/工具包）+ !critical」，哪怕之前因为祖先链传播
-     *   protect=true，也**强制重置 protect=false 并打 kill_flag**。原因：
-     *   这类"父 sh/su 遗留包装层"理论上脚本执行完就该退，即便它的子/孙里有用户被保护二进制
-     *   （通过 &/nohup/setsid 后台），父进程被杀基本不会触发 SIGHUP 伤害子；
-     *   就算误伤了前台挂起的 sh（脚本没跑完），代价也只是用户再手动跑一次脚本，
-     *   远小于"残留一堆 sh 占内存 + 用户反馈'没清干净'"的代价。 */
-    size_t seeds_wrapper = 0, seeds_app = 0, forced_wrapper = 0;
+    /* ---- Phase B：白名单最小集合（仅"用户二进制正本"，去掉祖先链 protect 传播） ----
+     * 用户明确口径：除了 Guard 守护程序本身 + 用户执行的二进制程序，其余全杀。
+     * 因此：
+     *   protect 对象只有一种：GUARD_TASK=1（脚本血统）且 !is_script_wrapper（不是
+     *   sh/su/toybox 等包装层）且 !critical 的进程 = 用户拉起的后台二进制。
+     *   不再做「子被保护 -> 父也保护」的祖先链传播。父 sh / 中间 su / 过渡 exec
+     *   全部属于"其余"，严格模式下必须清理。 */
     for (size_t i = 0; i < count; i++) {
         ProcRecord *r = &procs[i];
-        if (r->critical)
-            continue;
+        if (r->critical) continue;
+        if (r->has_guard_task && !r->is_script_wrapper) r->protect = true;
+    }
 
-        bool wrapper_seed = r->has_guard_task && r->is_script_wrapper;
-        if (wrapper_seed && r->protect) {
-            r->protect = false;
-            forced_wrapper++;
-        }
-
-        if (r->protect)
-            continue;
+    /* ---- Phase C：打 kill_flag 种子（严格模式 = 除了 critical + protect 全杀光） ----
+     * 种子优先级：
+     *   (a) is_guard_self = 1            → Guard 应用 UI/Service/子进程（只留守护二进制）
+     *   (b) GUARD_TASK=1 && wrapper = 1  → 脚本血统下的 su/sh/toybox/toolbox…等包装层
+     *   (c) GUARD_TASK=1 && !wrapper && !protect → Phase B 异常兜底（理论不会发生）
+     *   (d) uid >= AID_APP (10000) 且 !critical 且 !protect
+     *       → App 沙箱 UID 区间内其余进程，作为"脚本/App 衍生残余"兜底种子
+     * Phase D 会把上述种子向下扩散到所有后代，形成一次性清理列表。 */
+    size_t seeds_wrapper = 0, seeds_app = 0, seeds_extra = 0;
+    for (size_t i = 0; i < count; i++) {
+        ProcRecord *r = &procs[i];
+        if (r->critical) continue;
+        if (r->protect)  continue;
 
         if (r->is_guard_self) {
             kill_flag[i] = true;
@@ -1075,13 +1050,26 @@ static void cleanup_script_leftovers(void)
             continue;
         }
 
+        bool wrapper_seed = r->has_guard_task && r->is_script_wrapper;
         if (wrapper_seed) {
             kill_flag[i] = true;
             seeds_wrapper++;
             continue;
         }
-    }
 
+        if (r->has_guard_task) {
+            kill_flag[i] = true;
+            seeds_extra++;
+            continue;
+        }
+
+        if ((int)r->uid >= 10000) {
+            kill_flag[i] = true;
+            seeds_extra++;
+            continue;
+        }
+    }
+    (void)seeds_extra;
     /* ---- Phase D：后代传递 kill_flag（父杀 -> 子杀，除非子被 protect/critical） ---- */
     bool kill_changed;
     do {
