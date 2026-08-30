@@ -744,14 +744,63 @@ public class MainActivity extends Activity {
             .show();
     }
 
+    // ============= Guard 存活精准判定（pidfile + kill -0 + Name 三重锁）=============
+    // 替代原先 pgrep -x Guard，避免僵尸/同名/su 返回码异常造成的“显示在运行实际没跑/停不掉”
+    static final String GUARD_NAME="Guard";
+
+    File pidFile(){ return new File(cfgFile.getAbsolutePath()+".pid"); }
+
+    int readPidFile(){
+        try{
+            File f=pidFile();
+            if(!f.exists()||f.length()==0) return 0;
+            String s=new String(java.nio.file.Files.readAllBytes(f.toPath()),"UTF-8").trim();
+            int pid=Integer.parseInt(s);
+            return pid>1 ? pid : 0;
+        }catch(Exception ignored){ return 0; }
+    }
+
+    boolean aliveByPid(int pid) throws Exception {
+        if(pid<=1) return false;
+        // 双重认证：1) kill -0 进程存在；2) /proc/<pid>/status Name == Guard（防 PID 复用）
+        String check="kill -0 "+pid+" 2>/dev/null && { Name=$(cat /proc/"+pid+"/status 2>/dev/null | grep '^Name:' | awk '{print $2}'); [ \"$Name\" = \""+GUARD_NAME+"\" ] && exit 0; } || exit 1";
+        return suExec(check).code==0;
+    }
+
+    int findGuardPid() throws Exception {
+        // 1) 优先 pidfile（最新写入、最精准）
+        int fp=readPidFile();
+        if(fp>1 && aliveByPid(fp)) return fp;
+
+        // 2) 兜底 pgrep -x，再核对 /proc 名字（避免 pgrep 命中原僵尸/同名进程）
+        Res r=suExec("pgrep -x "+GUARD_NAME+" | head -n 1");
+        if(r.code!=0) return 0;
+        String[] lines=r.out.trim().split("\\s+");
+        for(String s:lines){
+            try{
+                int pid=Integer.parseInt(s.trim());
+                if(aliveByPid(pid)) return pid;
+            }catch(Exception ignored){}
+        }
+        // 清理无效 pidfile
+        File pf=pidFile(); if(pf.exists()) pf.delete();
+        return 0;
+    }
+
+    boolean isRunningReal(){
+        try{ return findGuardPid()>1; }
+        catch(Exception e){ return false; }
+    }
+
     void syncService(){
         new Thread(()->{
             try{
-                boolean up=suExec("pgrep -x Guard").code==0;
+                final int pid=findGuardPid();
+                final boolean up=pid>1;
                 runOnUiThread(()->{
                     serviceRunning=up;
                     updateStatus();
-                    if(up) appendLog("[系统] 检测到 Guard 服务已在运行");
+                    if(up) appendLog("[系统] 检测到 Guard 服务已在运行（pid="+pid+"）");
                 });
             }catch(Exception ignored){}
         }).start();
@@ -764,10 +813,12 @@ public class MainActivity extends Activity {
         appendLog("[系统] 正在启动服务…（目标 "+tc+"，禁用 "+fc+"）");
         new Thread(()->{
             try{
-                if(suExec("pgrep -x Guard").code==0){
+                int oldPid=findGuardPid();
+                if(oldPid>1){
+                    final int op=oldPid;
                     runOnUiThread(()->{
                         serviceRunning=true; updateStatus();
-                        appendLog("[系统] Guard 服务已在运行，无需重复启动");
+                        appendLog("[系统] Guard 服务已在运行，无需重复启动（pid="+op+"）");
                         showFloat("服务已在运行");
                     });
                     return;
@@ -775,40 +826,92 @@ public class MainActivity extends Activity {
                 File exe=ensureBinary();
                 String q=shq(exe.getAbsolutePath());
                 String cfg=shq(cfgFile.getAbsolutePath());
-                String cmd="chmod 755 "+q+" ; "+q+" "+cfg;
-                final Process p=new ProcessBuilder("su","-c",cmd).redirectErrorStream(true).start();
-                serviceProc=p;
-                runOnUiThread(()->{
-                    serviceRunning=true; updateStatus();
-                    appendLog("[系统] 服务进程已启动，配置："+cfgFile.getAbsolutePath());
-                    showFloat("服务已启动");
-                });
-                BufferedReader r=new BufferedReader(new InputStreamReader(p.getInputStream()));
-                String line;
-                while((line=r.readLine())!=null){
-                    // 去掉 Guard 自带的时间戳前缀（应用统一显示 [HH:mm:ss]），并跳过空行
-                    if(line.startsWith("[20")){
-                        int idx=line.indexOf("] ");
-                        if(idx>0) line=line.substring(idx+2);
-                    }
-                    if(line.isEmpty()) continue;
-                    appendLog(line);
+                // 启动时先删掉陈旧 pidfile，再用 nohup 后台挂起，避免读日志线程阻塞
+                File pf=pidFile(); if(pf.exists()) pf.delete();
+                String cmd="rm -f "+shq(pf.getAbsolutePath())+" ; chmod 755 "+q+" ; nohup "+q+" "+cfg+" > "+shq(new File(getFilesDir(),"guard.log").getAbsolutePath())+" 2>&1 &";
+                int code=suExec(cmd).code;
+                if(code!=0){
+                    runOnUiThread(()->appendLog("[错误] 启动命令执行失败（code="+code+"）"));
+                    return;
                 }
-                runOnUiThread(()->{
-                    serviceRunning=false; updateStatus();
-                    appendLog("[系统] 服务已退出");
-                });
-                serviceProc=null;
+                // 最多等 1.5 秒，轮询 pidfile + kill-0 双确认启动成功
+                int waitPid=0;
+                for(int i=0;i<15;i++){
+                    try{ Thread.sleep(100); }catch(Exception e){}
+                    int p=findGuardPid();
+                    if(p>1){ waitPid=p; break; }
+                }
+                final int okPid=waitPid;
+                if(okPid>1){
+                    runOnUiThread(()->{
+                        serviceRunning=true; updateStatus();
+                        appendLog("[系统] Guard 服务启动成功（pid="+okPid+"，配置="+cfgFile.getAbsolutePath()+"）");
+                        showFloat("服务已启动");
+                    });
+                }else{
+                    // 启动后没等到 pid：把实时日志前 20 行贴出来便于排查崩溃点
+                    StringBuilder lg=new StringBuilder();
+                    try{
+                        java.io.File logf=new File(getFilesDir(),"guard.log");
+                        if(logf.exists()){
+                            try(java.io.BufferedReader br=new java.io.BufferedReader(new java.io.FileReader(logf))){
+                                String ln; int n=0;
+                                while((ln=br.readLine())!=null && n++<24) lg.append(ln).append('\n');
+                            }
+                        }
+                    }catch(Exception ignored){}
+                    final String tail=lg.length()>0?lg.toString():"（无输出）";
+                    runOnUiThread(()->{
+                        serviceRunning=false; updateStatus();
+                        appendLog("[错误] Guard 启动后未进入存活状态（pidfile 未出现/进程退出）。崩溃日志:\n"+tail);
+                        showFloat("服务启动失败");
+                    });
+                }
             }catch(Exception e){
-                runOnUiThread(()->appendLog("[错误] 启动失败："+e.getMessage()));
+                runOnUiThread(()->appendLog("[错误] 启动异常："+e.getMessage()));
             }
         }).start();
     }
 
     void stopService(){
         appendLog("[系统] 正在停止服务…");
-        showFloat("服务已停止");
-        runRoot("pkill -TERM -x Guard","已发送停止信号");
+        new Thread(()->{
+            int pid=0; String errMsg=null;
+            try{
+                pid=findGuardPid();
+                boolean had=false;
+                // 1) 按真实 PID 精准发信号（先礼后兵）
+                if(pid>1){
+                    had=true;
+                    if(suExec("kill -TERM "+pid+" ; sleep 0.3 ; if kill -0 "+pid+" 2>/dev/null; then kill -KILL "+pid+" ; fi ; rm -f "+shq(pidFile().getAbsolutePath())).code!=0){
+                        errMsg="（按 pid 发信号返回码异常）";
+                    }
+                    try{ Thread.sleep(200); }catch(Exception ignored){}
+                }
+                // 2) 兜底：pkill 清同名僵尸（不管 findGuardPid 有没有）
+                had = had || (suExec("pkill -KILL -x "+GUARD_NAME+" ; pkill -0 -x "+GUARD_NAME+" ; echo $?").code==0);
+                final boolean had2=had;
+                // 3) 最终校验存活状态
+                int stillPid=findGuardPid();
+                final boolean stillRunning=stillPid>1;
+                final int finalPid=stillPid;
+                final String finalErr=errMsg;
+                runOnUiThread(()->{
+                    serviceRunning=stillRunning; updateStatus();
+                    if(stillRunning){
+                        appendLog("[警告] 服务可能未完全停止（剩余 pid="+finalPid+"）"+(finalErr!=null?finalErr:""));
+                        showFloat("服务可能未完全停止");
+                    }else{
+                        File pf=pidFile(); if(pf.exists()) pf.delete();
+                        appendLog("[系统] 服务已停止"+(had2?"（已发送信号）":"（本就未运行）"));
+                        showFloat("服务已停止");
+                    }
+                });
+            }catch(Exception e){
+                String msg=e.getMessage();
+                runOnUiThread(()->{ appendLog("[错误] 停止失败："+msg); showFloat("停止失败"); });
+            }
+        }).start();
     }
 
     // ==================== 配置 ====================

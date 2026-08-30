@@ -28,6 +28,7 @@
 #define MAX_OUTPUT  65536
 
 static char config_file[MAX_PATH];
+static char pid_file[MAX_PATH];    /* ${config_file}.pid —— Java 端 kill -0 校验存活用 */
 
 #define DEFAULT_INTERVAL 2
 #define MIN_INTERVAL     1
@@ -62,11 +63,13 @@ static struct stat cfg_stat;
 static bool cfg_stat_valid;
 
 static bool reload_if_changed(void);
+static void remove_pidfile(void);    /* forward decl：供 signal_handler / atexit 使用 */
 
 static void signal_handler(int sig)
 {
     (void)sig;
     running = 0;
+    remove_pidfile();
 }
 
 static void log_msg(const char *fmt, ...)
@@ -94,6 +97,35 @@ static void log_msg(const char *fmt, ...)
     va_end(ap);
 
     fflush(stderr);
+}
+
+/* 写当前 PID 到 pid_file（格式一行纯文本），Java 端用 kill -0 精准确认存活，
+ * 避免 pgrep -x 被僵尸进程/同名/子进程 su 返回码异常误导。*/
+static void write_pidfile(void)
+{
+    if (!pid_file[0])
+        return;
+
+    int fd = open(pid_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        log_msg("[警告] 无法写入 pidfile %s: %s\n",
+                pid_file, strerror(errno));
+        return;
+    }
+
+    char tmp[32];
+    int n = snprintf(tmp, sizeof(tmp), "%d\n", (int)getpid());
+    if (n > 0)
+        (void)write(fd, tmp, (size_t)n);
+    close(fd);
+    chmod(pid_file, 0644);
+}
+
+/* 清理 pidfile。进程退出/收信号时调用，避免 Java 端误判。*/
+static void remove_pidfile(void)
+{
+    if (pid_file[0])
+        (void)unlink(pid_file);
 }
 
 static void trim(char *s)
@@ -710,12 +742,21 @@ static bool read_environ_has_guard_task(pid_t pid)
     if (fd < 0)
         return false;
 
-    char buf[16384];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    /* 16KB 缓冲改用堆分配，避免 NDK stack protector 对大栈数组的误触发 */
+    enum { ENV_BUF_SZ = 16384 };
+    char *buf = (char *)calloc(1, ENV_BUF_SZ);
+    if (!buf) {
+        close(fd);
+        return false;
+    }
+
+    ssize_t n = read(fd, buf, ENV_BUF_SZ - 1);
     close(fd);
 
-    if (n <= 0)
+    if (n <= 0) {
+        free(buf);
         return false;
+    }
 
     buf[n] = '\0';
 
@@ -727,11 +768,14 @@ static bool read_environ_has_guard_task(pid_t pid)
         size_t seg_len = strnlen(p, (size_t)(end - p));
         if (seg_len == 0)
             break;
-        if (strncmp(p, "GUARD_TASK=", 11) == 0)
+        if (strncmp(p, "GUARD_TASK=", 11) == 0) {
+            free(buf);
             return true;
+        }
         p += seg_len + 1;
     }
 
+    free(buf);
     return false;
 }
 
@@ -776,8 +820,8 @@ static bool read_cmdline_first(pid_t pid, char *out, size_t out_sz)
 static bool is_guard_app_process(int appuid, uid_t uid,
                                  const char *name, const char *cmdline0)
 {
-    if (appuid < 0)
-        return false;
+    if (appuid < 10000)
+        return false; /* Android 应用 UID >= FIRST_APPLICATION_UID (10000)；root/系统账号勿误判 */
     if ((int)uid != appuid)
         return false;
 
@@ -1495,7 +1539,22 @@ int main(int argc, char **argv)
     else
         copy_str(config_file, sizeof(config_file), DEFAULT_CONFIG);
 
-    prctl(PR_SET_NAME, "Guard", 0, 0, 0);
+    /* pidfile = ${config_file}.pid，Java 端 kill -0 精准确认存活 */
+    {
+        size_t cl = strlen(config_file);
+        if (cl + strlen(".pid") + 1 <= sizeof(pid_file)) {
+            memcpy(pid_file, config_file, cl);
+            memcpy(pid_file + cl, ".pid", 5);
+            atexit(remove_pidfile);
+        }
+    }
+
+    /* 双保险改进程名：prctl 失败时退回到 argv[0] 覆盖（不依赖 libc 对 comm 传参） */
+    if (prctl(PR_SET_NAME, "Guard", 0, 0, 0) < 0 && argv && argv[0]) {
+        static char guard_name[] = "Guard";
+        argv[0] = guard_name;
+        (void)prctl(PR_SET_NAME, guard_name, 0, 0, 0);
+    }
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -1506,6 +1565,10 @@ int main(int argc, char **argv)
     state_count = 0;
     active = false;
     current_fg[0] = '\0';
+
+    /* 写 pidfile：comm 设置完成立即落盘，让 Java 端 kill -0 立刻就能验证。
+     * 若崩在 ensure_config 之前，Java 端会读到 pid 但 kill -0 失败，判为未启动。 */
+    write_pidfile();
 
     /*
      * 确保配置文件存在。
