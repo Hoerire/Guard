@@ -1017,7 +1017,10 @@ public class MainActivity extends Activity {
         } catch (Throwable ignored) {}
     }
 
-    // 用于：C 守护日志/历史载入，不重复加时间戳，原样追加到 UI 文本框 + 写 ui.log(持久化)
+    // 用于：C 守护日志(guard.log)/历史载入，**不写盘**不重复持久化。
+    // 规则：只有 UI 主动 appendLog（带 [HH:mm:ss.SSS] 前缀）会写 ui.log；
+    //       守护日志本来就持久在 guard.log，若再 appendPersist(ui.log)，
+    //       重开 loadHistoricLogs 时 guard.log→ui.log→再读 ui.log→指数级重复。
     void appendRawLog(String line){
         if(line==null||line.isEmpty()) return;
         runOnUiThread(()->{
@@ -1028,7 +1031,6 @@ public class MainActivity extends Activity {
                 if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
             }
         });
-        appendPersist(uiLogFile(), line+"\n");
     }
 
     void appendLog(final String line){
@@ -1056,78 +1058,179 @@ public class MainActivity extends Activity {
         try{ new java.io.FileOutputStream(guardLogFile(),false).close(); guardLogOffset=0; }catch(Throwable ignored){}
     }
 
-    // 载入历史日志：先守护(guard.log 后 256KB) 再 UI(ui.log 后 256KB)，避免 App 被杀就看不到过去的排查信息
-    // 行级读，每 250 条让出一次主线程（防大文件 ANR）
+    // 载入历史日志：先守护(guard.log 后 256KB) 再 UI(ui.log 后 256KB)，避免 App 被杀就看不到过去的排查信息。
+    // 注：都使用"字节级读 + UTF-8 边界检测"，避免 BufferedReader/InputStreamReader 内部
+    // 按 8192 字节块切读时把多字节字符截断产生 U+FFFD �；也避免读 guard.log 再写 ui.log 导致的指数重复。
     void loadHistoricLogs(){
         new Thread(()->{
-            // (A) 载入守护日志
+            // (A) 载入守护日志 → 只塞内存，不写盘（守护日志本身就持久化在 guard.log）
             try{
                 File gf=guardLogFile();
                 if(gf.exists()&&gf.length()>0){
-                    long skip=0; long len=gf.length();
-                    if(len>TRIM_TO) skip=len-TRIM_TO;
+                    long len=gf.length();
+                    long from = (len>TRIM_TO) ? (len-TRIM_TO) : 0L;
+                    long want = len - from;
                     java.io.FileInputStream fi=new java.io.FileInputStream(gf);
-                    fi.skip(skip);
-                    BufferedReader br=new BufferedReader(new InputStreamReader(fi,"UTF-8"),8192);
-                    String ln; int batch=0;
-                    while((ln=br.readLine())!=null){
-                        if(ln.isEmpty()) continue;
-                        appendRawLog(ln);
-                        if((++batch)%250==0){ try{ Thread.sleep(10); }catch(Throwable ignored){} }
+                    fi.skip(from);
+                    byte[] buf = new byte[(int)Math.min(want, (long)TRIM_TO + 1)];
+                    int total = 0;
+                    while (total < buf.length) {
+                        int n = fi.read(buf, total, buf.length - total);
+                        if (n <= 0) break;
+                        total += n;
                     }
-                    br.close(); fi.close();
+                    fi.close();
+                    if (total > 0) {
+                        // 若 from>0 且正好卡在 UTF-8 多字节中间，开头 1-3 字节是上一段的"后半续字节"
+                        // （10xxxxxx 或无首字节的残片），跳过到下一个字符边界，避免 decode 出 �。
+                        int start = 0;
+                        for (int k = 0; k < Math.min(3, total); k++) {
+                            int v = buf[k] & 0xFF;
+                            if ((v & 0x80) == 0) { start = k; break; }                 // ASCII 头
+                            if ((v & 0xE0) == 0xC0 || (v & 0xF0) == 0xE0 || (v & 0xF8) == 0xF0) { start = k; break; } // 多字节首
+                            // 10xxxxxx：还在残缺区，继续
+                        }
+                        int keepBack = 0;
+                        int scanEnd = Math.max(start, total - 3);
+                        for (int k = total - 1; k >= scanEnd; k--) {
+                            int v = buf[k] & 0xFF;
+                            int need;
+                            if      ((v & 0x80) == 0) need = 1;
+                            else if ((v & 0xE0) == 0xC0) need = 2;
+                            else if ((v & 0xF0) == 0xE0) need = 3;
+                            else if ((v & 0xF8) == 0xF0) need = 4;
+                            else continue;
+                            int have = total - k;
+                            if (have < need) keepBack = have;
+                            break;
+                        }
+                        int cutAt = total - keepBack;
+                        int usable = (cutAt > start) ? (cutAt - start) : 0;
+                        if (usable > 0) {
+                            String s = new String(buf, start, usable, "UTF-8");
+                            // 按 \n 切行，直接手动塞到 logBuffer（不写 ui.log，避免指数重复）
+                            int st = 0, batch = 0;
+                            while (true) {
+                                int nl = s.indexOf('\n', st);
+                                String piece;
+                                if (nl < 0) { piece = s.substring(st); } else { piece = s.substring(st, nl); }
+                                if (!piece.isEmpty()) {
+                                    final String line = piece;
+                                    final boolean doSleep = ((++batch) % 250 == 0);
+                                    runOnUiThread(()->{
+                                        synchronized (logLock) {
+                                            logBuffer.append(line).append("\n");
+                                            if(logBuffer.length()>30000) logBuffer.delete(0,15000);
+                                            logView.setText(logBuffer.toString());
+                                            if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+                                        }
+                                    });
+                                    if (doSleep) { try{ Thread.sleep(10); }catch(Throwable ignored){} }
+                                }
+                                if (nl < 0) break;
+                                st = nl + 1;
+                            }
+                        }
+                    }
                     guardLogOffset = len; // 追日志从最新位置开始，历史不重复
                 }
             }catch(Throwable ignored){}
-            // (B) 载入 UI 日志
+            // (B) 载入 UI 日志 → 只塞内存（ui.log 里本来就是持久化的 UI 前缀行）
             try{
                 File uf=uiLogFile();
                 if(uf.exists()&&uf.length()>0){
-                    long skip=0; long len=uf.length();
-                    if(len>TRIM_TO) skip=len-TRIM_TO;
+                    long len=uf.length();
+                    long from = (len>TRIM_TO) ? (len-TRIM_TO) : 0L;
+                    long want = len - from;
                     java.io.FileInputStream fi=new java.io.FileInputStream(uf);
-                    fi.skip(skip);
-                    BufferedReader br=new BufferedReader(new InputStreamReader(fi,"UTF-8"),8192);
-                    String ln; int batch=0;
-                    while((ln=br.readLine())!=null){
-                        if(ln.isEmpty()) continue;
-                        // ui.log 每行本身已有 [HH:mm:ss.SSS] 前缀，直接 appendRaw 不加 ts 不写重复持久化：
-                        //   手动加到 logBuffer，避免 appendPersist 二次写 ui.log 导致循环
-                        final String line2=ln;
-                        runOnUiThread(()->{
-                            synchronized (logLock) {
-                                logBuffer.append(line2).append("\n");
-                                if(logBuffer.length()>30000) logBuffer.delete(0,15000);
-                                logView.setText(logBuffer.toString());
-                                if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
-                            }
-                        });
-                        if((++batch)%250==0){ try{ Thread.sleep(10); }catch(Throwable ignored){} }
+                    fi.skip(from);
+                    byte[] buf = new byte[(int)Math.min(want, (long)TRIM_TO + 1)];
+                    int total = 0;
+                    while (total < buf.length) {
+                        int n = fi.read(buf, total, buf.length - total);
+                        if (n <= 0) break;
+                        total += n;
                     }
-                    br.close(); fi.close();
+                    fi.close();
+                    if (total > 0) {
+                        int start = 0;
+                        for (int k = 0; k < Math.min(3, total); k++) {
+                            int v = buf[k] & 0xFF;
+                            if ((v & 0x80) == 0) { start = k; break; }
+                            if ((v & 0xE0) == 0xC0 || (v & 0xF0) == 0xE0 || (v & 0xF8) == 0xF0) { start = k; break; }
+                        }
+                        int keepBack = 0;
+                        int scanEnd = Math.max(start, total - 3);
+                        for (int k = total - 1; k >= scanEnd; k--) {
+                            int v = buf[k] & 0xFF;
+                            int need;
+                            if      ((v & 0x80) == 0) need = 1;
+                            else if ((v & 0xE0) == 0xC0) need = 2;
+                            else if ((v & 0xF0) == 0xE0) need = 3;
+                            else if ((v & 0xF8) == 0xF0) need = 4;
+                            else continue;
+                            int have = total - k;
+                            if (have < need) keepBack = have;
+                            break;
+                        }
+                        int cutAt = total - keepBack;
+                        int usable = (cutAt > start) ? (cutAt - start) : 0;
+                        if (usable > 0) {
+                            String s = new String(buf, start, usable, "UTF-8");
+                            int st = 0, batch = 0;
+                            while (true) {
+                                int nl = s.indexOf('\n', st);
+                                String piece;
+                                if (nl < 0) { piece = s.substring(st); } else { piece = s.substring(st, nl); }
+                                if (!piece.isEmpty()) {
+                                    final String line = piece;
+                                    final boolean doSleep = ((++batch) % 250 == 0);
+                                    runOnUiThread(()->{
+                                        synchronized (logLock) {
+                                            logBuffer.append(line).append("\n");
+                                            if(logBuffer.length()>30000) logBuffer.delete(0,15000);
+                                            logView.setText(logBuffer.toString());
+                                            if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+                                        }
+                                    });
+                                    if (doSleep) { try{ Thread.sleep(10); }catch(Throwable ignored){} }
+                                }
+                                if (nl < 0) break;
+                                st = nl + 1;
+                            }
+                        }
+                    }
                 }
             }catch(Throwable ignored){}
         }).start();
     }
 
-    // 守护日志实时追：每 500ms 读 guard.log 的增量（比上次已知偏移多的部分），按行注入 UI
+    // 守护日志实时追：每 500ms 读 guard.log 的增量（比上次已知偏移多的部分），按行注入 UI。
+    // 修复：原始做法固定大小 chunk+按\n切会导致 (1) 最后一行无\n时整段被退回→下次重复读同字节；
+    // (2) 若 chunk 恰好在 UTF-8 多字节字符中间断开，new String(bytes,"UTF-8") 产生 U+FFFD �。
+    // 解法：用 byte[] carry（上次残片）做前缀，先按 0x0A 切出整行；对最后一段不完整部分，
+    // 做 UTF-8 结尾截断扫描：若末尾 1-3 字节是一个不完整的多字节序列前缀，就留下不 decode，
+    // 下次与新字节合并再解，彻底避免 �。
     void startLogTailer(){
         if (logTailerRunning || (logTailerThread!=null && logTailerThread.isAlive())) return;
         logTailerRunning=true;
         logTailerThread=new Thread(()->{
             long knownLen = 0;
+            byte[] carry = new byte[0]; // 上次残片（无换行的尾部字节，可能含截断的 UTF-8）
             java.io.ByteArrayOutputStream tailBuf = new java.io.ByteArrayOutputStream(2048);
             while (logTailerRunning) {
                 try {
                     File gf = guardLogFile();
                     if (!gf.exists()) {
                         guardLogOffset = 0; knownLen = 0;
+                        carry = new byte[0];
                         try{ Thread.sleep(500); }catch(Throwable t_ign){} continue;
                     }
                     long nowLen = gf.length();
                     // 文件被截断/轮替（比如 clearLog 或外部删了重建）：从 0 重新追
                     if (nowLen < knownLen || nowLen < guardLogOffset) {
                         guardLogOffset = 0; knownLen = nowLen;
+                        carry = new byte[0];
                     }
                     if (nowLen <= guardLogOffset) {
                         knownLen = nowLen;
@@ -1149,23 +1252,92 @@ public class MainActivity extends Activity {
                         tailBuf.write(b, 0, n); got += n;
                     }
                     fi.close();
-                    if (tailBuf.size() > 0) {
-                        // 按行切分
-                        String chunk = tailBuf.toString("UTF-8");
+                    int newBytesN = tailBuf.size();
+                    if (newBytesN > 0 || carry.length > 0) {
+                        // 合并 carry + 新读入字节
+                        byte[] merged = new byte[carry.length + newBytesN];
+                        if (carry.length > 0) System.arraycopy(carry, 0, merged, 0, carry.length);
+                        if (newBytesN > 0) System.arraycopy(tailBuf.toByteArray(), 0, merged, carry.length, newBytesN);
+
                         int st = 0;
                         while (true) {
-                            int nl = chunk.indexOf('\n', st);
+                            int nl = -1;
+                            for (int k = st; k < merged.length; k++) {
+                                if (merged[k] == (byte)'\n') { nl = k; break; }
+                            }
                             if (nl < 0) break;
-                            String ln = (nl > st) ? chunk.substring(st, nl) : "";
-                            if (!ln.isEmpty()) appendRawLog(ln);
+                            int lineLen = nl - st;
+                            if (lineLen > 0) {
+                                // 整行：不会卡在 UTF-8 边界中间（换行是 ASCII，必在字符边界）
+                                String ln = new String(merged, st, lineLen, "UTF-8");
+                                if (!ln.isEmpty()) appendRawLog(ln);
+                            }
                             st = nl + 1;
                         }
-                        // 如果最后没有换行，先记下到 guardLogOffset 之前（下次读新的再合并处理），避免截断
-                        if (st == 0) {
-                            // 没找到换行：把 want 原样退回去，下次再读（可能是半行）
-                            guardLogOffset = from;
+                        // 尾部残片：没换行的最后一段，需检测 UTF-8 截断位置
+                        int tailLen = merged.length - st;
+                        if (tailLen == 0) {
+                            carry = new byte[0];
+                            guardLogOffset = from + got;
                         } else {
-                            guardLogOffset = from + st;
+                            // 从末尾往回最多看 3 字节（UTF-8 单字符最长 4 字节），
+                            // 找到"多字节首字节"位置与其应有的字符长度比对，
+                            // 若该首字节之后剩余字节不足其声明长度，就是被截断的起点。
+                            int keepBack = 0;
+                            int scanStart = Math.max(st, merged.length - 3);
+                            for (int k = merged.length - 1; k >= scanStart; k--) {
+                                int v = merged[k] & 0xFF;
+                                int need;
+                                if      ((v & 0x80) == 0) { need = 1; } // 0xxxxxxx 单字节
+                                else if ((v & 0xE0) == 0xC0) { need = 2; } // 110xxxxx  2字节
+                                else if ((v & 0xF0) == 0xE0) { need = 3; } // 1110xxxx  3字节
+                                else if ((v & 0xF8) == 0xF0) { need = 4; } // 11110xxx  4字节
+                                else { continue; } // 10xxxxxx 续字节，继续往前找首字节
+                                int have = merged.length - k;
+                                if (have < need) {
+                                    keepBack = have;
+                                }
+                                break;
+                            }
+                            int cutAt = merged.length - keepBack;
+                            int emitLen = cutAt - st;
+                            if (emitLen > 0) {
+                                String lastEmit = new String(merged, st, emitLen, "UTF-8");
+                                // 如果这段末尾无换行，理论上是 cutAt 截断产生的，但 cutAt 已经落在
+                                // 字符边界上，仍可能包含若干整行（若 keepBack 之前还隐藏着换行）。
+                                // 由于外层已把所有 \n 处理完，这里剩下的就是无换行的一串字符。
+                                // 若 contain \n 说明 keepBack 前的位置不合理（不可能），再兜底切。
+                                int lastNl = lastEmit.lastIndexOf('\n');
+                                if (lastNl >= 0) {
+                                    String pre = lastEmit.substring(0, lastNl);
+                                    String post = lastEmit.substring(lastNl + 1);
+                                    for (String piece : pre.split("\n")) {
+                                        if (!piece.isEmpty()) appendRawLog(piece);
+                                    }
+                                    // post 退回到 carry
+                                    byte[] postBytes = post.getBytes("UTF-8");
+                                    byte[] newCarry = new byte[postBytes.length + keepBack];
+                                    System.arraycopy(postBytes, 0, newCarry, 0, postBytes.length);
+                                    if (keepBack > 0) System.arraycopy(merged, cutAt, newCarry, postBytes.length, keepBack);
+                                    carry = newCarry;
+                                } else {
+                                    // 无换行且是字符边界：整段作为 carry（下次读到换行再 emit）
+                                    byte[] newCarry = new byte[emitLen + keepBack];
+                                    System.arraycopy(merged, st, newCarry, 0, emitLen);
+                                    if (keepBack > 0) System.arraycopy(merged, cutAt, newCarry, emitLen, keepBack);
+                                    carry = newCarry;
+                                }
+                            } else {
+                                // emitLen==0：全部字节属于"待补足的 UTF-8 残片"，原样 carry
+                                byte[] newCarry = new byte[keepBack];
+                                if (keepBack > 0) System.arraycopy(merged, cutAt, newCarry, 0, keepBack);
+                                carry = newCarry;
+                            }
+                            // 注意：只有真正处理完（已 decode+emit）的字节才推进 offset，
+                            // carry 里的字节在当前文件流中已被读到，但在"逻辑消费层"还未 emit，
+                            // 所以下次循环必须保留 carry，并推进 offset 到 from+got，
+                            // 因为对应文件字节已经被读取并保存在 carry，不应再从文件重读。
+                            guardLogOffset = from + got;
                         }
                     } else {
                         guardLogOffset = from + want;

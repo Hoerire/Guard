@@ -1041,11 +1041,28 @@ static void cleanup_script_leftovers(void)
         }
     } while (protect_changed);
 
-    /* ---- Phase C：打 kill_flag 种子 ---- */
-    size_t seeds_wrapper = 0, seeds_app = 0;
+    /* ---- Phase C：打 kill_flag 种子 ----
+     * 兜底特殊规则（解决"包装层因有保护子孙被 protect 传播而清不干净"）：
+     *   若一个进程同时满足「GUARD_TASK=1（脚本血统）+ is_script_wrapper=1
+     *   （属于 shell/su/工具包）+ !critical」，哪怕之前因为祖先链传播
+     *   protect=true，也**强制重置 protect=false 并打 kill_flag**。原因：
+     *   这类"父 sh/su 遗留包装层"理论上脚本执行完就该退，即便它的子/孙里有用户被保护二进制
+     *   （通过 &/nohup/setsid 后台），父进程被杀基本不会触发 SIGHUP 伤害子；
+     *   就算误伤了前台挂起的 sh（脚本没跑完），代价也只是用户再手动跑一次脚本，
+     *   远小于"残留一堆 sh 占内存 + 用户反馈'没清干净'"的代价。 */
+    size_t seeds_wrapper = 0, seeds_app = 0, forced_wrapper = 0;
     for (size_t i = 0; i < count; i++) {
         ProcRecord *r = &procs[i];
-        if (r->critical || r->protect)
+        if (r->critical)
+            continue;
+
+        bool wrapper_seed = r->has_guard_task && r->is_script_wrapper;
+        if (wrapper_seed && r->protect) {
+            r->protect = false;
+            forced_wrapper++;
+        }
+
+        if (r->protect)
             continue;
 
         if (r->is_guard_self) {
@@ -1054,7 +1071,7 @@ static void cleanup_script_leftovers(void)
             continue;
         }
 
-        if (r->has_guard_task && r->is_script_wrapper) {
+        if (wrapper_seed) {
             kill_flag[i] = true;
             seeds_wrapper++;
             continue;
@@ -1228,23 +1245,86 @@ static void cleanup_script_leftovers(void)
             closedir(dp2);
         }
 
-        if (leftover_wrapper == 0) {
+        /* ---- 8) 兜底再清理：若仍有残留包装层，本次复核直接逐个 SIGKILL ----
+         * 原因：首轮清理（TERM→400ms→KILL）可能因"sh 在子进程退出前处于 wait/waitpid
+         * 阻塞态且 400ms 刚巧不够"或"protect 传播重置后子先死但父 sh 在信号窗内
+         * 没来得及处理"而漏。对复核时仍活的包装层残留不犹豫，直接 SIGKILL 再等
+         * 200ms 并复核一次，报告最终结果。 */
+        if (leftover_wrapper > 0) {
+            size_t kill2 = 0;
+            /* 复扫一遍并 SIGKILL；先存在局部数组（readdir 过程中不宜直接改态） */
+            enum { MAX_LK2 = 256 };
+            pid_t lk2[MAX_LK2]; size_t lk2n = 0;
+            rewinddir(dp2);
+            struct dirent *de3;
+            while ((de3 = readdir(dp2)) != NULL && lk2n < MAX_LK2) {
+                if (de3->d_name[0] < '0' || de3->d_name[0] > '9') continue;
+                int pidi3 = atoi(de3->d_name);
+                if (pidi3 <= 1) continue;
+                pid_t pid3 = (pid_t)pidi3;
+                char nm3[MAX_NAME] = {0}; pid_t pp3 = -1; uid_t ui3 = (uid_t)-1; bool is_k3 = false;
+                if (!read_proc_status(pid3, nm3, sizeof(nm3), &pp3, &ui3, &is_k3)) continue;
+                if (is_k3 || pidi3 == (int)me || pidi3 == (int)my_pp) continue;
+                if (is_critical_by_name(nm3)) continue;
+                if (is_script_wrapper_name(nm3) && read_environ_has_guard_task(pid3)) {
+                    lk2[lk2n++] = pid3;
+                }
+            }
+            for (size_t i = 0; i < lk2n; i++) {
+                if (kill(lk2[i], SIGKILL) == 0) kill2++;
+            }
+            struct timespec ts2;
+            ts2.tv_sec = 0; ts2.tv_nsec = 200L * 1000L * 1000L;
+            nanosleep(&ts2, NULL);
+            int ws2 = 0;
+            while (waitpid((pid_t)-1, &ws2, WNOHANG) > 0) {}
+
+            /* 再复核：最终残留 */
+            size_t final_leftover = 0, final_protect = 0;
+            size_t sn2 = 0;
+            rewinddir(dp2);
+            struct dirent *de4;
+            while ((de4 = readdir(dp2)) != NULL) {
+                if (de4->d_name[0] < '0' || de4->d_name[0] > '9') continue;
+                int pidi4 = atoi(de4->d_name);
+                if (pidi4 <= 1) continue;
+                pid_t pid4 = (pid_t)pidi4;
+                char nm4[MAX_NAME] = {0}; pid_t pp4 = -1; uid_t ui4 = (uid_t)-1; bool is_k4 = false;
+                if (!read_proc_status(pid4, nm4, sizeof(nm4), &pp4, &ui4, &is_k4)) continue;
+                if (is_k4 || pidi4 == (int)me || pidi4 == (int)my_pp) continue;
+                if (is_critical_by_name(nm4)) continue;
+                bool wr4 = is_script_wrapper_name(nm4);
+                bool t4  = read_environ_has_guard_task(pid4);
+                if (t4 && wr4) {
+                    final_leftover++;
+                    if (sn2 < 12) {
+                        samples[sn2].pid = pid4;
+                        snprintf(samples[sn2].name, sizeof(samples[0].name), "%s", nm4);
+                        sn2++;
+                    }
+                } else if (t4 && !wr4) {
+                    final_protect++;
+                }
+            }
+
+            if (final_leftover == 0) {
+                log_msg("[脚本清理] 复核残留 %zu 个，兜底 SIGKILL %zu 个后最终残留=0，用户二进制仍存活 %zu 个\n",
+                        leftover_wrapper, kill2, final_protect);
+            } else {
+                char sb2[512]; char *p2 = sb2; size_t left2 = sizeof(sb2); *p2 = '\0';
+                for (size_t i = 0; i < sn2; i++) {
+                    int n = snprintf(p2, left2, "%s pid=%d%s",
+                                     samples[i].name, (int)samples[i].pid,
+                                     (i + 1 < sn2) ? ", " : "");
+                    if (n <= 0 || (size_t)n >= left2) break;
+                    p2 += n; left2 -= (size_t)n;
+                }
+                log_msg("[脚本清理] 复核残留 %zu 个，兜底 SIGKILL %zu 个后仍剩 %zu 个，用户二进制仍存活 %zu 个。样本：%s\n",
+                        leftover_wrapper, kill2, final_leftover, final_protect, sb2);
+            }
+        } else {
             log_msg("[脚本清理] 清理后复核：包装层残留 0 个（已清理干净），用户管理二进制仍存活 %zu 个\n",
                     protected_alive);
-        } else {
-            char sample_buf[512];
-            char *p = sample_buf;
-            size_t left = sizeof(sample_buf);
-            *p = '\0';
-            for (size_t i = 0; i < sample_n; i++) {
-                int n = snprintf(p, left, "%s pid=%d%s",
-                                 samples[i].name, (int)samples[i].pid,
-                                 (i + 1 < sample_n) ? ", " : "");
-                if (n <= 0 || (size_t)n >= left) break;
-                p += n; left -= (size_t)n;
-            }
-            log_msg("[脚本清理] 清理后复核：包装层残留 %zu 个（未完全清理干净），用户二进制仍存活 %zu 个。样本：%s\n",
-                    leftover_wrapper, protected_alive, sample_buf);
         }
     }
 
