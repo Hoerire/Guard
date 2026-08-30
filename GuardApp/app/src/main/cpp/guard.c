@@ -671,6 +671,8 @@ typedef struct {
     bool  is_kernel;          // kernel 线程（Name 含 '['）
     bool  has_guard_task;     // environ 中 GUARD_TASK=1
     bool  critical;           // 系统关键进程（绝不杀）
+    bool  is_guard_self;      // Guard 应用自身的 UI/Service 进程（允许杀，只留守护）
+    char  cmdline0[MAX_PKG];  // cmdline 首段（常等于包名或 "包名:service"）
     char  name[MAX_NAME];
 } ProcRecord;
 
@@ -685,8 +687,7 @@ static bool is_critical_by_name(const char *name)
         "writeback", "kblockd", "cryptd", "netd",
         "ueventd", "vold", "lmkd", "hwservicemanager",
         "servicemanager", "healthd", "zygote", "zygote64",
-        "zygote32", "app_process", "app_process32",
-        "app_process64", "system_server", "surfaceflinger",
+        "zygote32", "system_server", "surfaceflinger",
         "audioserver", "cameraserver", "drm",
         "installd", "keystore", "storaged", "logd",
         "logcat", NULL
@@ -729,6 +730,71 @@ static bool read_environ_has_guard_task(pid_t pid)
         if (strncmp(p, "GUARD_TASK=", 11) == 0)
             return true;
         p += seg_len + 1;
+    }
+
+    return false;
+}
+
+/* 读取 /proc/<pid>/cmdline 的 argv[0]（NUL 分隔首段），最多写入 out_sz-1 字节，
+ * 用于区分同一个 app_process 可执行名下的不同应用（包名就是 cmdline[0]） */
+static bool read_cmdline_first(pid_t pid, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0)
+        return false;
+    out[0] = '\0';
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", (int)pid);
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0)
+        return false;
+
+    buf[n] = '\0';
+    size_t fl = strnlen(buf, (size_t)n);
+    if (fl == 0)
+        return false; /* 内核线程 cmdline 为空 */
+    size_t cp = fl < (out_sz - 1) ? fl : (out_sz - 1);
+    memcpy(out, buf, cp);
+    out[cp] = '\0';
+    return true;
+}
+
+/* 判断是否是 Guard 应用自身的进程（包名或子进程服务名）：
+ *   - uid == cfg.appuid（同 Linux UID，应用沙箱识别）
+ *   - 并且 cmdline 前缀匹配 Guard 包名（com.example.guard 或 com.example.guard:xxx）
+ *   - 或者 Name 是 app_process / app_process32 / app_process64 且 uid 吻合（多
+ *     种 ROM 上 zygote fork 的 app 主进程名可能没改到 app_process，只能靠 uid）
+ *  仅用于触发目标应用时「杀自身应用 UI，只留守护」。 */
+static bool is_guard_app_process(int appuid, uid_t uid,
+                                 const char *name, const char *cmdline0)
+{
+    if (appuid < 0)
+        return false;
+    if ((int)uid != appuid)
+        return false;
+
+    /* cmdline 明确是 Guard 包名（含 :service 多进程） */
+    if (cmdline0 && cmdline0[0]) {
+        if (strcmp(cmdline0, "com.example.guard") == 0)
+            return true;
+        if (strncmp(cmdline0, "com.example.guard:", 18) == 0)
+            return true;
+    }
+
+    /* cmdline 读不到时兜底：app_process 主进程名 + 同 UID，基本上就是 Guard 自己 */
+    if (name && name[0]) {
+        if (strcmp(name, "app_process") == 0 ||
+            strcmp(name, "app_process32") == 0 ||
+            strcmp(name, "app_process64") == 0)
+            return true;
     }
 
     return false;
@@ -839,6 +905,16 @@ static void cleanup_script_leftovers(void)
         if (!r->critical)
             r->has_guard_task = read_environ_has_guard_task(pid);
 
+        /* 次判据：Guard 应用自身的 UI / Service 进程（包名或 app_process 主进程）
+         * 用户明确要求：触发目标应用时允许连自身 App 一起关掉，只留守护 */
+        if (!r->critical) {
+            (void)read_cmdline_first(pid, r->cmdline0, sizeof(r->cmdline0));
+            r->is_guard_self = is_guard_app_process(cfg.appuid,
+                                                    r->uid,
+                                                    r->name,
+                                                    r->cmdline0[0] ? r->cmdline0 : NULL);
+        }
+
         count++;
     }
     closedir(dp);
@@ -856,10 +932,10 @@ static void cleanup_script_leftovers(void)
         return;
     }
 
-    /* 先标记种子 */
+    /* 先标记种子：GUARD_TASK=1 进程 + Guard 应用自身（App UI/Service，只留守护） */
     for (size_t i = 0; i < count; i++) {
         ProcRecord *r = &procs[i];
-        if (!r->critical && r->has_guard_task) {
+        if (!r->critical && (r->has_guard_task || r->is_guard_self)) {
             kill_flag[i] = true;
         }
     }
