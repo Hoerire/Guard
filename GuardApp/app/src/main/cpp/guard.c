@@ -9,8 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -42,6 +45,7 @@ typedef struct {
 
 typedef struct {
     unsigned int interval;
+    int appuid;                     // Guard 应用的 Linux UID（兜底识别脚本残留血统）
     Package target[MAX_TARGET];
     size_t target_count;
     Package freeze[MAX_FREEZE];
@@ -521,12 +525,20 @@ static bool enable_pkg(const char *pkg)
     return true;
 }
 
+/* 前向声明：cleanup_script_leftovers 定义在 handle_event 之前，
+ * 供 activate 首次进入目标应用时调用 */
+static void cleanup_script_leftovers(void);
+
 static void activate(void)
 {
     if (active)
         log_msg("[配置/前台更新] 重新执行禁用\n");
-    else
+    else {
+        /* 触发（首次进入）目标应用时：清理脚本/终端及其子孙残留进程，
+         * 保证进入禁用模式后后台无无关工作负荷。其余时机不调用。 */
+        cleanup_script_leftovers();
         log_msg("[进入目标应用] 开始批量禁用\n");
+    }
 
     for (size_t i = 0; i < cfg.freeze_count && running; i++)
         disable_pkg(cfg.freeze[i].name);
@@ -627,6 +639,348 @@ static bool comp_matches(const char *comp,
     }
 
     return false;
+}
+
+/* ============================================================
+ * cleanup_script_leftovers() —— 触发目标应用时清理脚本残留进程
+ *
+ * 识别策略（按可靠性从高到低）：
+ *   1. 主判据：进程 environ 中存在 GUARD_TASK=1（Java 端在所有脚本/终端/
+ *      ELF 子进程的 ProcessBuilder / export 中强制注入，后代默认继承）。
+ *   2. 为了覆盖「脚本在自身内部 unset GUARD_TASK 再后台拉 daemon」的
+ *      逃逸场景，额外递归寻找种子进程的全部后代（子/孙/曾孙…）。
+ *   3. 白名单：系统关键进程（PID 0/1/2、守护自己、守护父进程、
+ *      zygote64/zygote/app_process/system_server 等）一律跳过，
+ *      避免触发目标应用时把系统/应用 UI 带挂。
+ *
+ * 杀伤流程：
+ *   - 先按「后代 → 祖先」顺序对每个 pid 发送 SIGTERM（15）
+ *   - usleep(400ms)，给脚本/进程处理退出机会
+ *   - 仍存活的 pid 再发送 SIGKILL（9）强制清理
+ *
+ * 说明：只在进入目标应用的瞬间调用一次，其余时机不清理，
+ *       既不误伤也不影响脚本正常运行时的持续进程。
+ * ============================================================ */
+#define MAX_PROC       32768
+#define MAX_NAME       64
+
+typedef struct {
+    pid_t pid;
+    pid_t ppid;
+    uid_t uid;
+    bool  is_kernel;          // kernel 线程（Name 含 '['）
+    bool  has_guard_task;     // environ 中 GUARD_TASK=1
+    bool  critical;           // 系统关键进程（绝不杀）
+    char  name[MAX_NAME];
+} ProcRecord;
+
+static bool is_critical_by_name(const char *name)
+{
+    if (!name || !name[0])
+        return false;
+
+    static const char * const list[] = {
+        "init", "kthreadd", "migration", "ksoftirqd",
+        "kworker", "rcu", "watchdog", "oom_reaper",
+        "writeback", "kblockd", "cryptd", "netd",
+        "ueventd", "vold", "lmkd", "hwservicemanager",
+        "servicemanager", "healthd", "zygote", "zygote64",
+        "zygote32", "app_process", "app_process32",
+        "app_process64", "system_server", "surfaceflinger",
+        "audioserver", "cameraserver", "drm",
+        "installd", "keystore", "storaged", "logd",
+        "logcat", NULL
+    };
+
+    for (size_t i = 0; list[i]; i++) {
+        if (strcmp(name, list[i]) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static bool read_environ_has_guard_task(pid_t pid)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/environ", (int)pid);
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+
+    char buf[16384];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0)
+        return false;
+
+    buf[n] = '\0';
+
+    // environ 是 '\0' 分隔的多个 "K=V" 字符串；逐段比对前缀
+    const char *p = buf;
+    const char *end = buf + n;
+
+    while (p < end) {
+        size_t seg_len = strnlen(p, (size_t)(end - p));
+        if (seg_len == 0)
+            break;
+        if (strncmp(p, "GUARD_TASK=", 11) == 0)
+            return true;
+        p += seg_len + 1;
+    }
+
+    return false;
+}
+
+static bool read_proc_status(pid_t pid, char *name_out, size_t name_sz,
+                             pid_t *ppid_out, uid_t *uid_out, bool *is_kernel_out)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
+
+    FILE *fp = fopen(path, "re");
+    if (!fp)
+        return false;
+
+    char line[512];
+    char name[MAX_NAME] = {0};
+    pid_t ppid = -1;
+    uid_t uid = (uid_t)-1;
+    bool kernel = false;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "Name:\t", 6) == 0) {
+            const char *v = line + 6;
+            size_t vl = strlen(v);
+            while (vl > 0 &&
+                   (v[vl - 1] == '\n' || v[vl - 1] == '\r' ||
+                    v[vl - 1] == ' '  || v[vl - 1] == '\t'))
+                vl--;
+            size_t cp = vl < (name_sz - 1) ? vl : (name_sz - 1);
+            memcpy(name, v, cp);
+            name[cp] = '\0';
+        } else if (strncmp(line, "PPid:\t", 6) == 0) {
+            const char *v = line + 6;
+            ppid = (pid_t)atoi(v);
+        } else if (strncmp(line, "Uid:\t", 5) == 0) {
+            const char *v = line + 5;
+            /* Uid: <RealUid> <EffectiveUid> <SavedSetUid> <FilesystemUid> */
+            unsigned long ru = strtoul(v, NULL, 10);
+            uid = (uid_t)ru;
+        }
+    }
+
+    fclose(fp);
+
+    if (name[0] == '[')
+        kernel = true;
+
+    if (name_out) snprintf(name_out, name_sz, "%s", name);
+    if (ppid_out) *ppid_out = ppid;
+    if (uid_out)  *uid_out  = uid;
+    if (is_kernel_out) *is_kernel_out = kernel;
+
+    return true;
+}
+
+static void cleanup_script_leftovers(void)
+{
+    pid_t me     = getpid();
+    pid_t my_pp  = getppid();
+
+    ProcRecord *procs = calloc(MAX_PROC, sizeof(ProcRecord));
+    if (!procs) {
+        log_msg("[脚本清理] 内存不足，跳过\n");
+        return;
+    }
+
+    size_t count = 0;
+
+    /* ---- 1) 遍历 /proc，收集数字 PID 的快照 ---- */
+    DIR *dp = opendir("/proc");
+    if (!dp) {
+        log_msg("[脚本清理] 无法打开 /proc errno=%d，跳过\n", errno);
+        free(procs);
+        return;
+    }
+
+    struct dirent *de;
+    while ((de = readdir(dp)) != NULL) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9')
+            continue;
+        if (count >= MAX_PROC)
+            break;
+
+        int pidi = atoi(de->d_name);
+        if (pidi <= 0)
+            continue;
+
+        pid_t pid = (pid_t)pidi;
+        ProcRecord *r = &procs[count];
+        memset(r, 0, sizeof(*r));
+        r->pid = pid;
+
+        if (!read_proc_status(pid, r->name, sizeof(r->name),
+                              &r->ppid, &r->uid, &r->is_kernel))
+            continue;
+
+        /* 绝对不能碰的白名单 */
+        if (pid == 1 || pid == 2 || pid == me || pid == my_pp) {
+            r->critical = true;
+        } else if (r->is_kernel) {
+            r->critical = true;
+        } else if (is_critical_by_name(r->name)) {
+            r->critical = true;
+        }
+
+        /* 主判据：GUARD_TASK 环境变量 */
+        if (!r->critical)
+            r->has_guard_task = read_environ_has_guard_task(pid);
+
+        count++;
+    }
+    closedir(dp);
+
+    if (count == 0) {
+        free(procs);
+        return;
+    }
+
+    /* ---- 2) 标记要清理的 PID 集合：种子 GUARD_TASK + 所有后代 ---- */
+    bool *kill_flag = calloc(count, sizeof(bool));
+    if (!kill_flag) {
+        log_msg("[脚本清理] 内存不足，跳过\n");
+        free(procs);
+        return;
+    }
+
+    /* 先标记种子 */
+    for (size_t i = 0; i < count; i++) {
+        ProcRecord *r = &procs[i];
+        if (!r->critical && r->has_guard_task) {
+            kill_flag[i] = true;
+        }
+    }
+
+    /* 再传递性标记后代（BFS 轮询式收敛，最多 N 轮，N<=count）
+     * 每一轮：若某个进程父被标记且自己不是 critical，则自己也标记 */
+    bool changed;
+    do {
+        changed = false;
+        for (size_t i = 0; i < count; i++) {
+            ProcRecord *r = &procs[i];
+            if (kill_flag[i] || r->critical)
+                continue;
+            pid_t ppid = r->ppid;
+            if (ppid <= 0)
+                continue;
+            for (size_t j = 0; j < count; j++) {
+                if (procs[j].pid == ppid && kill_flag[j]) {
+                    kill_flag[i] = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    } while (changed);
+
+    /* ---- 3) 深度层级，按深度从大到小排序，保证先杀子再杀父 ---- */
+    int  *depth  = calloc(count, sizeof(int));
+    int  *order  = calloc(count, sizeof(int));
+    if (!depth || !order) {
+        log_msg("[脚本清理] 内存不足，跳过\n");
+        free(depth); free(order); free(kill_flag); free(procs);
+        return;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        order[i] = (int)i;
+        if (!kill_flag[i]) { depth[i] = -1; continue; }
+        int d = 0;
+        size_t cur = i;
+        /* 防止循环（极端异常），限制最多 255 层 */
+        while (d < 255) {
+            pid_t ppid = procs[cur].ppid;
+            if (ppid <= 0) break;
+            size_t j;
+            for (j = 0; j < count; j++) {
+                if (procs[j].pid == ppid) break;
+            }
+            if (j == count) break;
+            if (!kill_flag[j]) break;
+            cur = j;
+            d++;
+        }
+        depth[i] = d;
+    }
+
+    /* 按深度降序（插入排序；进程数通常小） */
+    for (size_t i = 1; i < count; i++) {
+        int t = order[i];
+        ssize_t j = (ssize_t)i - 1;
+        while (j >= 0 && depth[order[j]] < depth[t]) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = t;
+    }
+
+    /* ---- 4) 收集 kill 列表 ---- */
+    pid_t *kill_list = calloc(MAX_PROC, sizeof(pid_t));
+    size_t kill_n = 0;
+    if (!kill_list) {
+        log_msg("[脚本清理] 内存不足，跳过\n");
+        free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
+        return;
+    }
+
+    for (size_t oi = 0; oi < count; oi++) {
+        size_t idx = (size_t)order[oi];
+        if (!kill_flag[idx])
+            continue;
+        if (kill_n < MAX_PROC)
+            kill_list[kill_n++] = procs[idx].pid;
+    }
+
+    if (kill_n == 0) {
+        free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
+        return;
+    }
+
+    log_msg("[脚本清理] 命中 %zu 个残留进程，开始清理…\n", kill_n);
+
+    /* ---- 5) SIGTERM（第一轮，温柔退出） ---- */
+    for (size_t i = 0; i < kill_n; i++) {
+        (void)kill(kill_list[i], SIGTERM);
+    }
+
+    /* 给脚本 400ms 响应时间 */
+    struct timespec ts1;
+    ts1.tv_sec  = 0;
+    ts1.tv_nsec = 400L * 1000L * 1000L;
+    nanosleep(&ts1, NULL);
+
+    /* ---- 6) 再发 SIGKILL 处理未退出者 ---- */
+    for (size_t i = 0; i < kill_n; i++) {
+        pid_t pid = kill_list[i];
+        /* 若已退出（kill errno ESRCH）则忽略 */
+        if (kill(pid, SIGKILL) != 0 && errno == ESRCH)
+            continue;
+    }
+
+    /* 回收子进程，避免僵尸（su/logcat/sh 的短生命 wrapper） */
+    int ws = 0;
+    while (waitpid((pid_t)-1, &ws, WNOHANG) > 0) {}
+
+    log_msg("[脚本清理] 清理完毕，已结束 %zu 个进程（TERM→KILL）\n", kill_n);
+
+    free(kill_list);
+    free(depth);
+    free(order);
+    free(kill_flag);
+    free(procs);
 }
 
 static void handle_event(const char *line)
@@ -929,6 +1283,7 @@ static int load_config(void)
     Config nc;
     memset(&nc, 0, sizeof(nc));
     nc.interval = DEFAULT_INTERVAL;
+    nc.appuid = -1;
 
     char line[MAX_LINE];
 
@@ -971,6 +1326,13 @@ static int load_config(void)
 
             nc.interval = (unsigned int)n;
         }
+        else if (strcmp(key, "appuid") == 0) {
+            char *end = NULL;
+            long n = strtol(value, &end, 10);
+            if (end == value || *end != '\0')
+                n = -1;
+            nc.appuid = (int)n;
+        }
         else if (strcmp(key, "target") == 0) {
             if (!add_target(&nc, value))
                 log_msg("[警告] 忽略非法 target：%s\n", value);
@@ -1011,9 +1373,10 @@ static int load_config(void)
     // 全部解析成功后才整体生效（失败时旧配置保持不变）
     cfg = nc;
 
-    log_msg("[配置加载完成] 目标应用 %zu 个，禁用应用 %zu 个\n",
+    log_msg("[配置加载完成] 目标应用 %zu 个，禁用应用 %zu 个，AppUID=%d\n",
             cfg.target_count,
-            cfg.freeze_count);
+            cfg.freeze_count,
+            cfg.appuid);
 
     return 0;
 }

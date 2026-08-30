@@ -45,8 +45,9 @@ public class MainActivity extends Activity {
         TEXT=0xFF2C3138, SUBTEXT=0xFF7C8694, DANGER_SOFT=0xFFFDE8EB, DANGER=0xFFE0535F,
         OK=0xFF3BB273, OFF=0xFFC7CED9;
     // 脚本/终端运行所需的完整环境：补全 PATH 与常用变量（默认 PATH 不完整，导致脚本命令找不到）
+    // GUARD_TASK=1 用于 C 守护进程遍历 /proc/<pid>/environ 时精准识别脚本血统进程，触发目标应用时一键清理
     static final String DEF_PATH="/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin:/vendor/xbin:/data/local/bin";
-    static final String SCRIPT_ENV="export PATH="+DEF_PATH+" HOME=/data/local/tmp LANG=en_US.UTF-8 TERM=xterm";
+    static final String SCRIPT_ENV="export PATH="+DEF_PATH+" HOME=/data/local/tmp LANG=en_US.UTF-8 TERM=xterm GUARD_TASK=1";
 
     TextView statusText, statusSub, targetPill, hidePill, scriptPill, pickerTitle, logView, floatToast;
     View statusDot;
@@ -827,7 +828,9 @@ public class MainActivity extends Activity {
         ArrayList<String> f=new ArrayList<>(fSet);
         StringBuilder s=new StringBuilder(); s.append("# Guard config\ninterval:2\n\n");
         for(String p:t)s.append("target:").append(p).append('\n'); s.append('\n');
-        for(String p:f)s.append("freeze:").append(p).append('\n');
+        for(String p:f)s.append("freeze:").append(p).append('\n'); s.append('\n');
+        // 应用 Linux UID：C 守护在 GUARD_TASK 环境变量失效时（如脚本修改 environ），可作兜底识别条件
+        s.append("appuid:").append(android.os.Process.myUid()).append('\n');
         final String content=s.toString();
         try{
             try{
@@ -1271,9 +1274,10 @@ public class MainActivity extends Activity {
                     // App 进程无权读取 /data 等目录，必须在 root shell 内判定 ELF 并执行：
                     // 读前 4 字节十六进制，等于 7f454c46（\x7fELF）即为二进制，直接 chmod+exec；否则按 sh 脚本运行。
                     // 首行输出 __GUARD_PID__=$$（shell 自身 PID），随后 exec 替换进程，
-                    // 保证该 PID 即真正执行脚本的 SH/二进制进程，用于清理日志
+                    // 保证该 PID 即真正执行脚本的 SH/二进制进程，用于清理日志。
+                    // GUARD_TASK=1 提前 export：无论走 ELF 分支还是 sh 脚本分支，后代进程 environ 都会带上，便于守护识别并清理。
                     String run=
-                        "echo __GUARD_PID__=$$; "+
+                        "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
                         "magic=$(head -c4 "+path+" 2>/dev/null | od -An -tx1 | tr -d ' \\n'); "+
                         "if [ \"$magic\" = \"7f454c46\" ]; then "+
                             "cd "+dirq+" && chmod +x "+path+" && export LD_LIBRARY_PATH="+dirq+":\\\"$LD_LIBRARY_PATH\\\" && exec "+path+"; "+
@@ -1293,6 +1297,7 @@ public class MainActivity extends Activity {
                     Map<String,String> e=pb.environment();
                     e.put("PATH",DEF_PATH); e.put("HOME","/data/local/tmp");
                     e.put("LANG","en_US.UTF-8"); e.put("TERM","xterm");
+                    e.put("GUARD_TASK","1");
                     p=pb.redirectErrorStream(true).start();
                 }
                 proc[0]=p;
@@ -1454,6 +1459,7 @@ public class MainActivity extends Activity {
                     Map<String,String> e=pb.environment();
                     e.put("PATH",DEF_PATH); e.put("HOME","/data/local/tmp");
                     e.put("LANG","en_US.UTF-8"); e.put("TERM","xterm");
+                    e.put("GUARD_TASK","1");
                 }
                 pb.redirectErrorStream(true);
                 final Process p=pb.start();
