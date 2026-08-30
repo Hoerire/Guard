@@ -64,7 +64,13 @@ public class MainActivity extends Activity {
     volatile boolean rootGranted=false, rootChecked=false, serviceRunning=false;
     volatile boolean logAtBottom=true;
     Process serviceProc=null;
+    final Object logLock=new Object();
     final StringBuilder logBuffer=new StringBuilder();
+    Thread logTailerThread;
+    volatile boolean logTailerRunning;
+    long guardLogOffset;
+    File uiLogFile(){ return new File(getFilesDir(),"ui.log"); }
+    File guardLogFile(){ return new File(getFilesDir(),"guard.log"); }
 
     // ===== 脚本终端 & 脚本管理 =====
     LinearLayout scriptContent, terminalContent, scriptFileBox;
@@ -98,6 +104,9 @@ public class MainActivity extends Activity {
         loadScriptPath();
         buildUi();
         buildHome();
+        // 日志三件套：载入历史 + 启动守护日志实时追踪（确保 App UI 被杀后也能在重开时看到全过程）
+        loadHistoricLogs();
+        startLogTailer();
         ensureBinaryAsync();
         loadAppsAsync();
     }
@@ -975,26 +984,248 @@ public class MainActivity extends Activity {
     }
 
     // ==================== 日志框 ====================
+    // 持久化写：将字符串追加到目标文件，超过 MAX(512KB) 截断为后 256KB（简单环形裁剪），保证写入稳定
+    static final int MAX_LOG_SZ = 512 * 1024;
+    static final int TRIM_TO   = 256 * 1024;
+    void appendPersist(File f, String raw) {
+        if (f == null || raw == null) return;
+        try {
+            long len = f.length();
+            if (len + raw.length() > MAX_LOG_SZ) {
+                // 截断：读后 TRIM_TO 字节，覆盖写
+                byte[] all = new byte[0];
+                if (f.exists()) {
+                    java.io.FileInputStream fi = new java.io.FileInputStream(f);
+                    java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                    long skip = len > TRIM_TO ? len - TRIM_TO : 0;
+                    fi.skip(skip);
+                    byte[] b = new byte[4096];
+                    int n;
+                    while ((n = fi.read(b)) > 0) bo.write(b, 0, n);
+                    fi.close();
+                    all = bo.toByteArray();
+                }
+                java.io.FileOutputStream fo = new java.io.FileOutputStream(f, false);
+                if (all.length > 0) fo.write(all);
+                fo.write(raw.getBytes("UTF-8"));
+                fo.flush(); fo.getFD().sync(); fo.close();
+            } else {
+                java.io.FileOutputStream fo = new java.io.FileOutputStream(f, true);
+                fo.write(raw.getBytes("UTF-8"));
+                fo.flush(); fo.getFD().sync(); fo.close();
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    // 用于：C 守护日志/历史载入，不重复加时间戳，原样追加到 UI 文本框 + 写 ui.log(持久化)
+    void appendRawLog(String line){
+        if(line==null||line.isEmpty()) return;
+        runOnUiThread(()->{
+            synchronized (logLock) {
+                logBuffer.append(line).append("\n");
+                if(logBuffer.length()>30000) logBuffer.delete(0,15000);
+                logView.setText(logBuffer.toString());
+                if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+            }
+        });
+        appendPersist(uiLogFile(), line+"\n");
+    }
+
     void appendLog(final String line){
         // 在调用线程取时（更贴近事件发生时刻），并精确到毫秒
         final String ts=new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date());
+        final String formatted="["+ts+"] "+line;
         runOnUiThread(()->{
-            logBuffer.append("[").append(ts).append("] ").append(line).append("\n");
-            if(logBuffer.length()>30000) logBuffer.delete(0,15000);
-            logView.setText(logBuffer.toString());
-            if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+            synchronized (logLock) {
+                logBuffer.append(formatted).append("\n");
+                if(logBuffer.length()>30000) logBuffer.delete(0,15000);
+                logView.setText(logBuffer.toString());
+                if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+            }
         });
+        appendPersist(uiLogFile(), formatted+"\n");
     }
 
     void clearLog(){
-        logBuffer.setLength(0);
-        logView.setText("");
+        synchronized (logLock) {
+            logBuffer.setLength(0);
+            logView.setText("");
+        }
+        // 清持久化：创建空文件覆盖
+        try{ new java.io.FileOutputStream(uiLogFile(),false).close(); }catch(Throwable ignored){}
+        try{ new java.io.FileOutputStream(guardLogFile(),false).close(); guardLogOffset=0; }catch(Throwable ignored){}
+    }
+
+    // 载入历史日志：先守护(guard.log 后 256KB) 再 UI(ui.log 后 256KB)，避免 App 被杀就看不到过去的排查信息
+    // 行级读，每 250 条让出一次主线程（防大文件 ANR）
+    void loadHistoricLogs(){
+        new Thread(()->{
+            // (A) 载入守护日志
+            try{
+                File gf=guardLogFile();
+                if(gf.exists()&&gf.length()>0){
+                    long skip=0; long len=gf.length();
+                    if(len>TRIM_TO) skip=len-TRIM_TO;
+                    java.io.FileInputStream fi=new java.io.FileInputStream(gf);
+                    fi.skip(skip);
+                    BufferedReader br=new BufferedReader(new InputStreamReader(fi,"UTF-8"),8192);
+                    String ln; int batch=0;
+                    while((ln=br.readLine())!=null){
+                        if(ln.isEmpty()) continue;
+                        appendRawLog(ln);
+                        if((++batch)%250==0){ try{ Thread.sleep(10); }catch(Throwable ignored){} }
+                    }
+                    br.close(); fi.close();
+                    guardLogOffset = len; // 追日志从最新位置开始，历史不重复
+                }
+            }catch(Throwable ignored){}
+            // (B) 载入 UI 日志
+            try{
+                File uf=uiLogFile();
+                if(uf.exists()&&uf.length()>0){
+                    long skip=0; long len=uf.length();
+                    if(len>TRIM_TO) skip=len-TRIM_TO;
+                    java.io.FileInputStream fi=new java.io.FileInputStream(uf);
+                    fi.skip(skip);
+                    BufferedReader br=new BufferedReader(new InputStreamReader(fi,"UTF-8"),8192);
+                    String ln; int batch=0;
+                    while((ln=br.readLine())!=null){
+                        if(ln.isEmpty()) continue;
+                        // ui.log 每行本身已有 [HH:mm:ss.SSS] 前缀，直接 appendRaw 不加 ts 不写重复持久化：
+                        //   手动加到 logBuffer，避免 appendPersist 二次写 ui.log 导致循环
+                        final String line2=ln;
+                        runOnUiThread(()->{
+                            synchronized (logLock) {
+                                logBuffer.append(line2).append("\n");
+                                if(logBuffer.length()>30000) logBuffer.delete(0,15000);
+                                logView.setText(logBuffer.toString());
+                                if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+                            }
+                        });
+                        if((++batch)%250==0){ try{ Thread.sleep(10); }catch(Throwable ignored){} }
+                    }
+                    br.close(); fi.close();
+                }
+            }catch(Throwable ignored){}
+        }).start();
+    }
+
+    // 守护日志实时追：每 500ms 读 guard.log 的增量（比上次已知偏移多的部分），按行注入 UI
+    void startLogTailer(){
+        if (logTailerRunning || (logTailerThread!=null && logTailerThread.isAlive())) return;
+        logTailerRunning=true;
+        logTailerThread=new Thread(()->{
+            long knownLen = 0;
+            java.io.ByteArrayOutputStream tailBuf = new java.io.ByteArrayOutputStream(2048);
+            while (logTailerRunning) {
+                try {
+                    File gf = guardLogFile();
+                    if (!gf.exists()) {
+                        guardLogOffset = 0; knownLen = 0;
+                        try{ Thread.sleep(500); }catch(Throwable t_ign){} continue;
+                    }
+                    long nowLen = gf.length();
+                    // 文件被截断/轮替（比如 clearLog 或外部删了重建）：从 0 重新追
+                    if (nowLen < knownLen || nowLen < guardLogOffset) {
+                        guardLogOffset = 0; knownLen = nowLen;
+                    }
+                    if (nowLen <= guardLogOffset) {
+                        knownLen = nowLen;
+                        try{ Thread.sleep(500); }catch(Throwable t_ign){} continue;
+                    }
+                    long from = guardLogOffset;
+                    long want = nowLen - from;
+                    java.io.FileInputStream fi = new java.io.FileInputStream(gf);
+                    fi.skip(from);
+                    // 一次最多读 64KB，避免追落后把主线程灌爆
+                    if (want > 65536) want = 65536;
+                    byte[] b = new byte[4096];
+                    tailBuf.reset();
+                    long got = 0;
+                    while (got < want) {
+                        int toRead = (int)Math.min((long)b.length, want - got);
+                        int n = fi.read(b, 0, toRead);
+                        if (n <= 0) break;
+                        tailBuf.write(b, 0, n); got += n;
+                    }
+                    fi.close();
+                    if (tailBuf.size() > 0) {
+                        // 按行切分
+                        String chunk = tailBuf.toString("UTF-8");
+                        int st = 0;
+                        while (true) {
+                            int nl = chunk.indexOf('\n', st);
+                            if (nl < 0) break;
+                            String ln = (nl > st) ? chunk.substring(st, nl) : "";
+                            if (!ln.isEmpty()) appendRawLog(ln);
+                            st = nl + 1;
+                        }
+                        // 如果最后没有换行，先记下到 guardLogOffset 之前（下次读新的再合并处理），避免截断
+                        if (st == 0) {
+                            // 没找到换行：把 want 原样退回去，下次再读（可能是半行）
+                            guardLogOffset = from;
+                        } else {
+                            guardLogOffset = from + st;
+                        }
+                    } else {
+                        guardLogOffset = from + want;
+                    }
+                    knownLen = nowLen;
+                    try{ Thread.sleep(500); }catch(Throwable t_ign){}
+                }catch(Throwable outer_ign){
+                    try{ Thread.sleep(500); }catch(Throwable t_ign){}
+                }
+            }
+        },"GuardLogTailer");
+        logTailerThread.setDaemon(true);
+        logTailerThread.start();
+    }
+
+    @Override protected void onDestroy(){
+        logTailerRunning=false;
+        if(logTailerThread!=null) logTailerThread.interrupt();
+        if(termProc!=null){ try{ termProc.destroy(); }catch(Exception ignored){} termProc=null; termIn=null; }
+        super.onDestroy();
     }
 
     // 导出运行日志到储存空间根目录（/sdcard/）：
     // 优先 root 写入以绕过 Android 11+ 的分区存储限制，导出后在任意文件管理器可见
+    // 合并 guard.log（守护全量）+ ui.log（App 操作全量），导出的 txt 是完整排查记录
+    String concatAllLogs(){
+        StringBuilder sb=new StringBuilder(256*1024);
+        try{
+            File gf=guardLogFile();
+            if(gf.exists()){
+                long len=gf.length(); long skip=(len>TRIM_TO)?(len-TRIM_TO):0;
+                java.io.FileInputStream fi=new java.io.FileInputStream(gf);
+                fi.skip(skip);
+                sb.append("============ Guard Daemon Log (files/guard.log) ============\n");
+                BufferedReader br=new BufferedReader(new InputStreamReader(fi,"UTF-8"),8192);
+                String ln; while((ln=br.readLine())!=null){ sb.append(ln).append('\n'); }
+                br.close(); fi.close();
+                sb.append('\n');
+            }
+        }catch(Throwable ignored){}
+        try{
+            File uf=uiLogFile();
+            if(uf.exists()){
+                long len=uf.length(); long skip=(len>TRIM_TO)?(len-TRIM_TO):0;
+                java.io.FileInputStream fi=new java.io.FileInputStream(uf);
+                fi.skip(skip);
+                sb.append("============ App UI Log (files/ui.log) ============\n");
+                BufferedReader br=new BufferedReader(new InputStreamReader(fi,"UTF-8"),8192);
+                String ln; while((ln=br.readLine())!=null){ sb.append(ln).append('\n'); }
+                br.close(); fi.close();
+            }
+        }catch(Throwable ignored){}
+        // 如果以上两份都为空，回退到内存 logBuffer（避免老版本升级后导出空内容）
+        if(sb.length()==0){
+            synchronized (logLock){ sb.append(logBuffer.toString()); }
+        }
+        return sb.toString();
+    }
     void exportLog(){
-        final String content=logBuffer.toString();
+        final String content=concatAllLogs();
         if(content.trim().isEmpty()){ showFloat("暂无日志可导出"); return; }
         final String name="Guard日志_"+new SimpleDateFormat("yyyyMMdd_HHmmss",Locale.getDefault()).format(new Date())+".txt";
         final String path="/sdcard/"+name;
@@ -1606,11 +1837,6 @@ public class MainActivity extends Activity {
         termInput.setText("");
         if(cmd.trim().isEmpty()) return;
         termWrite(cmd);
-    }
-
-    @Override protected void onDestroy(){
-        super.onDestroy();
-        if(termProc!=null){ try{ termProc.destroy(); }catch(Exception ignored){} termProc=null; termIn=null; }
     }
 
     // ==================== 工具 ====================

@@ -1176,6 +1176,78 @@ static void cleanup_script_leftovers(void)
 
     log_msg("[脚本清理] 清理完毕，已结束 %zu 个进程（TERM→KILL）\n", kill_n);
 
+    /* ---- 7) 清理后复核：再扫一次 /proc，确认残留与保护效果 ----
+     * 统计仍存活的：
+     *   a) GUARD_TASK=1 且 is_script_wrapper=1 且 !critical 且 !protect 的进程
+     *      = 本该被清但没清掉的"残留包装层"（应该为 0 才算干净）
+     *   b) GUARD_TASK=1 且 !is_script_wrapper 的用户二进制保护数
+     *      = 仍存活的被管理后台程序（应>0，否则用户后台程序可能被杀了）
+     * 同时打印残留前 12 个样本 PID/Name，便于用户判断问题。
+     * ------------------------------------------------------------- */
+    {
+        DIR *dp2 = opendir("/proc");
+        size_t leftover_wrapper = 0;
+        size_t protected_alive = 0;
+        struct { pid_t pid; char name[MAX_NAME]; } samples[12];
+        size_t sample_n = 0;
+        if (dp2) {
+            struct dirent *de2;
+            while ((de2 = readdir(dp2)) != NULL) {
+                if (de2->d_name[0] < '0' || de2->d_name[0] > '9')
+                    continue;
+                int pidi = atoi(de2->d_name);
+                if (pidi <= 1) continue;
+                pid_t pid2 = (pid_t)pidi;
+
+                char nm2[MAX_NAME] = {0};
+                pid_t pp2 = -1;
+                uid_t ui2 = (uid_t)-1;
+                bool is_k2 = false;
+                if (!read_proc_status(pid2, nm2, sizeof(nm2), &pp2, &ui2, &is_k2))
+                    continue;
+                if (is_k2 || pidi == (int)me || pidi == (int)my_pp)
+                    continue;
+                if (is_critical_by_name(nm2))
+                    continue;
+
+                bool wr2 = is_script_wrapper_name(nm2);
+                bool t2  = read_environ_has_guard_task(pid2);
+
+                if (t2 && wr2) {
+                    leftover_wrapper++;
+                    if (sample_n < 12) {
+                        samples[sample_n].pid = pid2;
+                        snprintf(samples[sample_n].name, sizeof(samples[0].name),
+                                 "%s", nm2);
+                        sample_n++;
+                    }
+                } else if (t2 && !wr2) {
+                    protected_alive++;
+                }
+            }
+            closedir(dp2);
+        }
+
+        if (leftover_wrapper == 0) {
+            log_msg("[脚本清理] 清理后复核：包装层残留 0 个（已清理干净），用户管理二进制仍存活 %zu 个\n",
+                    protected_alive);
+        } else {
+            char sample_buf[512];
+            char *p = sample_buf;
+            size_t left = sizeof(sample_buf);
+            *p = '\0';
+            for (size_t i = 0; i < sample_n; i++) {
+                int n = snprintf(p, left, "%s pid=%d%s",
+                                 samples[i].name, (int)samples[i].pid,
+                                 (i + 1 < sample_n) ? ", " : "");
+                if (n <= 0 || (size_t)n >= left) break;
+                p += n; left -= (size_t)n;
+            }
+            log_msg("[脚本清理] 清理后复核：包装层残留 %zu 个（未完全清理干净），用户二进制仍存活 %zu 个。样本：%s\n",
+                    leftover_wrapper, protected_alive, sample_buf);
+        }
+    }
+
     free(kill_list);
     free(depth);
     free(order);
