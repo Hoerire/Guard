@@ -106,6 +106,7 @@ public class MainActivity extends Activity {
         buildHome();
         loadPreviousLogs();
         appendLog("[系统] —— 会话开始 ——");
+        scrollToLogBottom();
         ensureBinaryAsync();
         loadAppsAsync();
     }
@@ -304,7 +305,7 @@ public class MainActivity extends Activity {
             logAtBottom=child==null||(scrollY+logScroll.getHeight())>=child.getHeight()-1;
         });
 
-        // 底部：工作原理 + Bug 反馈
+        // 底部：说明文档 + Bug 反馈
         LinearLayout bottomRow=new LinearLayout(this);
         bottomRow.setOrientation(LinearLayout.HORIZONTAL);
         bottomRow.setGravity(Gravity.CENTER);
@@ -312,13 +313,13 @@ public class MainActivity extends Activity {
         homeContent.addView(bottomRow);
 
         TextView principle=new TextView(this);
-        principle.setText("工作原理");
+        principle.setText("说明文档");
         principle.setTextSize(13);
         principle.setTextColor(PRIMARY);
         principle.setTypeface(Typeface.DEFAULT,Typeface.BOLD);
         principle.setPaintFlags(principle.getPaintFlags()|Paint.UNDERLINE_TEXT_FLAG);
         principle.setPadding(dp(10),dp(8),dp(10),dp(8));
-        principle.setOnClickListener(v->showPrinciple());
+        principle.setOnClickListener(v->openDocs());
         LinearLayout.LayoutParams plp=new LinearLayout.LayoutParams(-2,-2);
         plp.setMargins(0,0,dp(24),0);
         bottomRow.addView(principle,plp);
@@ -1010,8 +1011,16 @@ public class MainActivity extends Activity {
             logBuffer.append(content);
             logView.setText(logBuffer.toString());
             // 始终滚到底部显示最新日志
-            logScroll.postDelayed(()->logScroll.fullScroll(View.FOCUS_DOWN),100);
+            logAtBottom=true;
+            scrollToLogBottom();
         }catch(Exception ignored){}
+    }
+
+    // 健壮的日志滚动：多帧延迟确保布局完成后才滚动
+    void scrollToLogBottom(){
+        logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+        logScroll.postDelayed(()->logScroll.fullScroll(View.FOCUS_DOWN),100);
+        logScroll.postDelayed(()->logScroll.fullScroll(View.FOCUS_DOWN),300);
     }
 
     // 导出运行日志到储存空间根目录（/sdcard/）：
@@ -1068,6 +1077,16 @@ public class MainActivity extends Activity {
             startActivity(i);
         }catch(Exception e){
             appendLog("[错误] 打开反馈链接失败："+e.getMessage());
+        }
+    }
+
+    void openDocs(){
+        try{
+            Intent i=new Intent(Intent.ACTION_VIEW,
+                Uri.parse("https://github.com/Hoerire/Guard#readme"));
+            startActivity(i);
+        }catch(Exception e){
+            appendLog("[错误] 打开说明文档失败："+e.getMessage());
         }
     }
 
