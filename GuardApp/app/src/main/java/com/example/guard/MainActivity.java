@@ -1817,39 +1817,34 @@ public class MainActivity extends Activity {
                 String path=shq(f.getAbsolutePath());
                 String dirq=shq(dir);
                 if(useSu){
-                    // App 进程无权读取 /data 等目录，必须在 root shell 内执行。
-                    // 已预判断 binary（isElf），直接分支：
+                    // ⚠️ Java 进程（AppUID=10441）无权读取 /data/local 等目录，
+                    // 所有文件 IO 必须在 su（root）shell 里完成。
                     if(binary){
+                        // ELF 二进制：su 里直接 exec（内核要求二进制必须从文件系统加载）
                         String run=
                             "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
                             "cd "+dirq+" && chmod +x "+path+" && export LD_LIBRARY_PATH="+dirq+":\"$LD_LIBRARY_PATH\" && exec "+path;
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }else{
-                        // sh 脚本：Base64 嵌在 -c 参数里执行。
-                        // 完全不依赖 stdin 管道（su -c 的 stdin 行为因实现而异不可靠），
-                        // 脚本内容也不落地（只有命令行参数里有 base64，执行完即清）。
-                        // Android 单条命令参数上限通常 > 128KB，远超普通脚本大小。
-                        String b64=java.util.Base64.getEncoder().encodeToString(java.nio.file.Files.readAllBytes(f.toPath()));
-                        // echo + 管道比 heredoc 兼容性好得多（heredoc 在某些 su -c 实现里会被吞）
-                        // base64 字符集 (A-Za-z0-9+/) 不含单引号，安全嵌入
+                        // sh 脚本：su 自己读文件 → base64 编码 → 解码 → 管道喂给 sh
+                        // 全程在 root shell 内，Java 不碰文件 IO。最终 exec 的 sh 进程
+                        // argv=["sh"]，无路径信息，实现匿名通道执行。
                         String run=
                             "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
                             "cd "+dirq+"; "+SCRIPT_ENV+"; "+
-                            "echo '"+b64+"' | /system/bin/toybox base64 -d | exec /system/bin/sh";
+                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh";
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }
                 }else{
+                    // 非 root 模式：脚本应在 Java 可访问的位置（sdcard / app 私有目录）
                     ProcessBuilder pb;
                     if(binary){
                         f.setExecutable(true,false);
                         pb=new ProcessBuilder(f.getAbsolutePath());
                     }else{
-                        // 普通用户权限：也用 base64 嵌在 sh -c 里，避免 stdin 管道问题
-                        String b64=java.util.Base64.getEncoder().encodeToString(java.nio.file.Files.readAllBytes(f.toPath()));
-                        String run=
+                        pb=new ProcessBuilder("/system/bin/sh","-c",
                             "export GUARD_TASK=1; "+
-                            "echo '"+b64+"' | /system/bin/toybox base64 -d | exec /system/bin/sh";
-                        pb=new ProcessBuilder("/system/bin/sh","-c",run);
+                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh");
                     }
                     pb.directory(f.getParentFile());
                     Map<String,String> e=pb.environment();
@@ -1881,11 +1876,19 @@ public class MainActivity extends Activity {
                     appendLog("[脚本] 执行完毕，退出码 "+rc);
                 });
             }catch(Exception e){
-                final String msg=e.getMessage();
+                // 详细错误：异常类型 + 消息 + 前因后果
+                StringBuilder sb=new StringBuilder();
+                sb.append(e.getClass().getSimpleName()).append(": ").append(e.getMessage());
+                // 加一点 stack trace 头部（前 3 行），方便定位
+                StackTraceElement[] st=e.getStackTrace();
+                for(int i=0;i<Math.min(3,st.length);i++){
+                    sb.append("\n    at ").append(st[i]);
+                }
+                final String msg=sb.toString();
                 final boolean cancelled=userClosed[0];
                 runOnUiThread(()->{
                     finished[0]=true;
-                    liveAppend(out,sc,"\n["+(cancelled?"已取消（进程被关闭）":("执行失败："+msg))+"]");
+                    liveAppend(out,sc,"\n["+(cancelled?"已取消（进程被关闭）":("执行失败："+e.getClass().getSimpleName()+": "+e.getMessage()))+"]");
                     if(!cancelled) appendLog("[脚本] 执行失败："+msg);
                 });
             }finally{
