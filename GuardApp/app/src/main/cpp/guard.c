@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/poll.h>
+#include <sys/prctl.h>
 #include <stdarg.h>
 
 /* ============ 常量 ============ */
@@ -231,6 +232,17 @@ int main(int argc, char **argv) {
         }
     }
     snprintf(pid_path, sizeof(pid_path), "%s.pid", config_path);
+
+    /* ===== 步骤 2.5: 设置进程名为 "Guard"，必须在 fork 前 =====
+       prctl 改 comm 名 (/proc/pid/status Name)
+       argv[0] 改命令名 (ps / top)
+       这样 Java 端 aliveByPid() 用 "Guard" 就能匹配到 */
+    prctl(PR_SET_NAME, "Guard", 0, 0, 0);
+    if (argv && argv[0]) {
+        /* argv[0] 可安全覆写：原字符串 > 6 字节，"Guard" 只有 6 字节 */
+        argv[0][0] = 'G'; argv[0][1] = 'u'; argv[0][2] = 'a';
+        argv[0][3] = 'r'; argv[0][4] = 'd'; argv[0][5] = '\0';
+    }
 
     /* ===== 步骤 3: 创建 pipe (syscall) ===== */
     int pipefd[2];
