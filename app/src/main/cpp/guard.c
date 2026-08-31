@@ -56,6 +56,7 @@ static bool active;
 static char current_fg[MAX_PKG];
 static struct stat cfg_stat;
 static bool cfg_stat_valid;
+static bool was_pip;  // 目标是否处于小窗状态
 
 static bool reload_if_changed(void);
 
@@ -602,6 +603,20 @@ static bool extract_component(const char *line,
     return comp[0] != '\0';
 }
 
+// 检查 comp 是否以 pkg 开头，且下一个字符是分隔符
+static bool prefix_match(const char *comp, size_t clen,
+                         const char *pkg, size_t plen)
+{
+    if (clen < plen)
+        return false;
+
+    if (strncmp(comp, pkg, plen) != 0)
+        return false;
+
+    char c = comp[plen];
+    return (c == '\0' || c == '/' || c == '.');
+}
+
 static bool comp_matches(const char *comp,
                          const Package *list,
                          size_t count)
@@ -614,19 +629,40 @@ static bool comp_matches(const char *comp,
     for (size_t i = 0; i < count; i++) {
         size_t plen = strlen(list[i].name);
 
-        if (clen < plen)
-            continue;
-
-        if (strncmp(comp, list[i].name, plen) != 0)
-            continue;
-
-        char c = comp[plen];
-
-        if (c == '\0' || c == '/' || c == '.')
+        // 精确匹配
+        if (prefix_match(comp, clen, list[i].name, plen))
             return true;
+
+        // 尝试去掉目标包名最后一段（如 bin.mt.plus.canary → bin.mt.plus）
+        // 处理同一应用不同包名变体（正式版/内测版）的情况
+        char *last_dot = strrchr(list[i].name, '.');
+        if (last_dot && last_dot > list[i].name) {
+            size_t short_len = (size_t)(last_dot - list[i].name);
+            if (prefix_match(comp, clen, list[i].name, short_len))
+                return true;
+        }
     }
 
     return false;
+}
+
+// 检测系统中是否有应用处于小窗（PiP）模式
+// 使用 dumpsys window 检查是否存在 PiP 窗口
+static bool is_pip_active(void)
+{
+    char out[8192];
+    const char *argv[] = {
+        "/system/bin/sh", "-c",
+        "dumpsys window 2>/dev/null | grep -ic 'pip'",
+        NULL
+    };
+
+    if (exec_cmd_rc(out, sizeof(out), argv) < 0)
+        return false;
+
+    trim(out);
+    int count = atoi(out);
+    return count > 0;
 }
 
 static void handle_event(const char *line)
@@ -652,6 +688,12 @@ static void handle_event(const char *line)
     // 保证服务运行中重新勾选应用也能即时生效
     bool cfg_changed = reload_if_changed();
 
+    // 没有目标或禁用应用时，仅记录日志不做处理
+    if (cfg.target_count == 0 || cfg.freeze_count == 0) {
+        log_msg("[前台事件] %s（等待配置）\n", comp);
+        return;
+    }
+
     bool same_fg = strcmp(current_fg, comp) == 0;
 
     if (same_fg && !cfg_changed)
@@ -669,12 +711,24 @@ static void handle_event(const char *line)
     copy_str(display, sizeof(display), comp);
 
     if (target) {
+        // 用 comp_matches 逻辑找到匹配的目标，显示其配置名
+        size_t clen = strlen(comp);
         for (size_t i = 0; i < cfg.target_count; i++) {
-            if (strncmp(comp, cfg.target[i].name,
-                        strlen(cfg.target[i].name)) == 0) {
+            size_t plen = strlen(cfg.target[i].name);
+            if (prefix_match(comp, clen, cfg.target[i].name, plen)) {
                 copy_str(display, sizeof(display),
                          cfg.target[i].name);
                 break;
+            }
+            // 尝试去掉最后一段
+            char *last_dot = strrchr(cfg.target[i].name, '.');
+            if (last_dot && last_dot > cfg.target[i].name) {
+                size_t short_len = (size_t)(last_dot - cfg.target[i].name);
+                if (prefix_match(comp, clen, cfg.target[i].name, short_len)) {
+                    copy_str(display, sizeof(display),
+                             cfg.target[i].name);
+                    break;
+                }
             }
         }
     } else {
@@ -688,10 +742,23 @@ static void handle_event(const char *line)
             display,
             target ? "【目标应用】" : "【普通应用】");
 
-    if (target)
+    if (target) {
+        was_pip = false;
         activate();
-    else
+    } else {
+        // 非目标应用进入前台时，检查目标是否处于小窗状态
+        if (active && is_pip_active()) {
+            was_pip = true;
+            log_msg("[小窗] 目标应用处于小窗状态，保持禁用\n");
+            return;
+        }
+        // 之前在小窗中，现已退出小窗
+        if (was_pip) {
+            was_pip = false;
+            log_msg("[小窗] 目标已退出小窗，开始恢复\n");
+        }
         deactivate();
+    }
 }
 
 static pid_t start_logcat(int *read_fd)
@@ -773,7 +840,8 @@ static bool monitor_logcat(void)
             .revents = 0
         };
 
-        int ret = poll(&pfd, 1, -1);
+        // 2 秒超时，用于周期性检查小窗状态
+        int ret = poll(&pfd, 1, 2000);
 
         if (ret < 0) {
             if (errno == EINTR)
@@ -782,6 +850,16 @@ static bool monitor_logcat(void)
             log_msg("[错误] poll() 失败 errno=%d\n", errno);
             ok = false;
             break;
+        }
+
+        // 超时：周期性检查小窗是否已退出
+        if (ret == 0) {
+            if (active && was_pip && !is_pip_active()) {
+                was_pip = false;
+                log_msg("[小窗] 目标已退出小窗（轮询检测），开始恢复\n");
+                deactivate();
+            }
+            continue;
         }
 
         if (pfd.revents & (POLLERR | POLLNVAL)) {
@@ -850,6 +928,8 @@ static bool monitor_logcat(void)
 
 static int create_config(void)
 {
+    // 不再生成带预设内容的默认配置，仅创建空配置文件
+    // 目标和禁用列表由 UI 勾选后写入
     FILE *fp = fopen(config_file, "w");
 
     if (!fp) {
@@ -859,27 +939,10 @@ static int create_config(void)
     }
 
     fprintf(fp,
-        "# ==================================================\n"
         "# Guard 配置\n"
-        "# ==================================================\n"
-        "# interval：保留配置字段，当前事件监听模式不使用\n"
-        "# target：触发应用\n"
-        "# freeze：进入目标后禁用\n"
-        "# ==================================================\n"
-        "\n"
+        "# target：目标应用（进入时触发禁用）\n"
+        "# freeze：禁用列表（目标进入前台时禁用）\n"
         "interval:2\n"
-        "\n"
-        "# ====== 目标应用 ======\n"
-        "target:com.tencent.tmgp.sgame\n"
-        "target:com.tencent.ig\n"
-        "target:com.tencent.tmgp.cf\n"
-        "target:com.tencent.tmgp.dfm\n"
-        "\n"
-        "# ====== 禁用列表 ======\n"
-        "freeze:me.weishu.kernelsu\n"
-        "freeze:me.bmax.apatch\n"
-        "freeze:bin.mt.plus\n"
-        "freeze:bin.mt.plus.canary\n"
     );
 
     fclose(fp);
@@ -889,7 +952,7 @@ static int create_config(void)
         log_msg("[警告] 无法修改 %s 权限 errno=%d\n",
                 config_file, errno);
 
-    log_msg("[信息] 已生成默认配置 %s\n", config_file);
+    log_msg("[信息] 已生成空配置 %s\n", config_file);
 
     return 0;
 }
@@ -999,13 +1062,11 @@ static int load_config(void)
     }
 
     if (nc.target_count == 0) {
-        log_msg("[错误] target 列表为空\n");
-        return -1;
+        log_msg("[提示] target 列表为空，等待 UI 勾选后热重载\n");
     }
 
     if (nc.freeze_count == 0) {
-        log_msg("[错误] freeze 列表为空\n");
-        return -1;
+        log_msg("[提示] freeze 列表为空，等待 UI 勾选后热重载\n");
     }
 
     // 全部解析成功后才整体生效（失败时旧配置保持不变）
@@ -1066,6 +1127,7 @@ int main(int argc, char **argv)
     memset(states, 0, sizeof(states));
     state_count = 0;
     active = false;
+    was_pip = false;
     current_fg[0] = '\0';
 
     /*

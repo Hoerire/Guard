@@ -616,7 +616,9 @@ public class MainActivity extends Activity {
                 if(mode==0) info.checkedT=is; else info.checkedF=is;
                 updateHomeCounts();
                 writeConfig(); // 勾选即自动保存
-                showFloat(info.label+(is?" 已选择":" 已取消"));
+                String tag = mode==0 ? "目标" : "禁用";
+                appendLog("[配置] "+(is?"勾选":"取消")+tag+"："+info.label+" ("+info.pkg+")");
+                showFloat(info.label+(is?" 已选择":" 已取消")+"\n"+info.pkg);
                 listBox.post(()->rebuildList()); // 勾选后自动置顶
             }
         });
