@@ -1076,17 +1076,35 @@ static bool read_proc_status(pid_t pid, char *name_out, size_t name_sz,
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/status", (int)pid);
 
-    FILE *fp = fopen(path, "re");
-    if (!fp)
+    /* 不使用 fopen/fgets/fclose：在 cleanup 复核扫描热路径上，刚被杀的进程
+     * /proc/<pid>/status 高速消失，fopen→失败→fclose→fopen 循环会让 Bionic
+     * FILE* 内部 pthread_mutex_t 经历 destroy→free→malloc→reuse，命中 FORTIFY
+     * "pthread_mutex_lock called on a destroyed mutex" → SIGABRT → 守护崩溃。
+     * 改用 open/read/close 系统调用 + 手动行解析，彻底绕开 FILE*。*/
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
         return false;
 
-    char line[512];
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+
+    if (n <= 0)
+        return false;
+
+    buf[n] = '\0';
+
     char name[MAX_NAME] = {0};
     pid_t ppid = -1;
     uid_t uid = (uid_t)-1;
     bool kernel = false;
 
-    while (fgets(line, sizeof(line), fp)) {
+    /* 手动按 \n 切行，找 Name:/PPid:/Uid: 三个字段 */
+    char *line = buf;
+    char *lend;
+    while (line < buf + n && (lend = memchr(line, '\n', (size_t)(buf + n - line))) != NULL) {
+        *lend = '\0';
+
         if (strncmp(line, "Name:\t", 6) == 0) {
             const char *v = line + 6;
             size_t vl = strlen(v);
@@ -1098,17 +1116,34 @@ static bool read_proc_status(pid_t pid, char *name_out, size_t name_sz,
             memcpy(name, v, cp);
             name[cp] = '\0';
         } else if (strncmp(line, "PPid:\t", 6) == 0) {
-            const char *v = line + 6;
-            ppid = (pid_t)atoi(v);
+            ppid = (pid_t)atoi(line + 6);
         } else if (strncmp(line, "Uid:\t", 5) == 0) {
-            const char *v = line + 5;
-            /* Uid: <RealUid> <EffectiveUid> <SavedSetUid> <FilesystemUid> */
-            unsigned long ru = strtoul(v, NULL, 10);
+            unsigned long ru = strtoul(line + 5, NULL, 10);
+            uid = (uid_t)ru;
+        }
+
+        line = lend + 1;
+    }
+
+    /* 处理最后一行（无 \n 结尾的情况）*/
+    if (line < buf + n) {
+        if (strncmp(line, "Name:\t", 6) == 0) {
+            const char *v = line + 6;
+            size_t vl = strlen(v);
+            while (vl > 0 &&
+                   (v[vl - 1] == '\n' || v[vl - 1] == '\r' ||
+                    v[vl - 1] == ' '  || v[vl - 1] == '\t'))
+                vl--;
+            size_t cp = vl < (name_sz - 1) ? vl : (name_sz - 1);
+            memcpy(name, v, cp);
+            name[cp] = '\0';
+        } else if (strncmp(line, "PPid:\t", 6) == 0) {
+            ppid = (pid_t)atoi(line + 6);
+        } else if (strncmp(line, "Uid:\t", 5) == 0) {
+            unsigned long ru = strtoul(line + 5, NULL, 10);
             uid = (uid_t)ru;
         }
     }
-
-    fclose(fp);
 
     if (name[0] == '[')
         kernel = true;
