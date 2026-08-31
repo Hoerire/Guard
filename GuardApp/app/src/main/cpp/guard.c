@@ -17,6 +17,16 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>   /* SYS_getdents64 + syscall() */
+/* linux_dirent64 结构 —— NDK 没提供 <linux/dirent.h>，自己定义一份。
+ * 对应内核的 struct linux_dirent64，d_reclen 是内核实际写入的记录长度。*/
+struct linux_dirent64 {
+    uint64_t        d_ino;
+    int64_t         d_off;
+    unsigned short  d_reclen;
+    unsigned char   d_type;
+    char            d_name[];
+};
 
 #define MAX_PATH     512
 #define DEFAULT_CONFIG "/data/local/tmp/Guard/config.txt"
@@ -1104,6 +1114,214 @@ static bool is_guard_app_process(int appuid, uid_t uid,
     return false;
 }
 
+/* ---- 纯系统调用 /proc 目录遍历器（零 FILE* 依赖） ----
+ *
+ * 用 open("/proc", O_RDONLY|O_DIRECTORY|O_CLOEXEC) 拿到裸 fd，
+ * 然后用 syscall(SYS_getdents64, fd, buf, sizeof(buf)) 逐条取 linux_dirent64。
+ * 完全绕开 opendir/readdir/closedir/rewinddir（它们在 Bionic 内部用 FILE*），
+ * 从根源上消除 Bionic FORTIFY "pthread_mutex_lock on destroyed mutex" 触发点。
+ *
+ * callback 原型：bool cb(const char *d_name, void *ctx)
+ *   - 仅对纯数字 d_name 调用（跳过 ., .., sys, self, timer_list 等）
+ *   - 返回 true：继续；返回 false：立即终止遍历
+ *
+ * 返回值：成功遍历完整条链路 = true；中途被 cb 终止或错误 = false
+ *
+ * 为什么不直接 read() /proc？read 也能读到目录项但不保证对齐且容易
+ * 漏掉内核新条目；getdents64 是 Linux 内核官方目录遍历接口。*/
+typedef bool (*proc_dir_cb)(const char *d_name, void *ctx);
+
+static bool proc_iterate(proc_dir_cb cb, void *ctx)
+{
+    int fd = open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return false;
+
+    char buf[4096];
+    bool ok = true;
+
+    while (1) {
+        ssize_t n = syscall(SYS_getdents64, fd, buf, sizeof(buf));
+        if (n <= 0) break;
+
+        size_t pos = 0;
+        while (pos < (size_t)n) {
+            struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + pos);
+            const char *name = de->d_name;
+
+            if (name[0] >= '0' && name[0] <= '9') {
+                if (!cb(name, ctx)) { ok = false; goto done; }
+            }
+            pos += de->d_reclen;
+        }
+    }
+
+done:
+    close(fd);
+    return ok;
+}
+
+/* ---- 前向声明：ScanCtx / CtxCheck / cb_* 在 read_proc_status 之前引用它 ---- */
+static bool read_proc_status(pid_t pid, char *name_out, size_t name_sz,
+                             pid_t *ppid_out, uid_t *uid_out, bool *is_kernel_out);
+
+/* ---- /proc 主扫描 context：cleanup_script_leftovers 第一次遍历 ---- */
+typedef struct {
+    ProcRecord *procs;
+    size_t     *count;
+    size_t      capacity;
+    pid_t       me;
+    pid_t       my_pp;
+} ScanCtx;
+
+static bool cb_scan_main(const char *d_name, void *pctx)
+{
+    ScanCtx *c = (ScanCtx *)pctx;
+    if (*c->count >= c->capacity) return false;
+
+    int pidi = atoi(d_name);
+    if (pidi <= 0) return true;
+    pid_t pid = (pid_t)pidi;
+
+    ProcRecord *r = &c->procs[*c->count];
+    memset(r, 0, sizeof(*r));
+    r->pid = pid;
+
+    if (!read_proc_status(pid, r->name, sizeof(r->name),
+                          &r->ppid, &r->uid, &r->is_kernel))
+        return true;
+
+    r->is_script_wrapper = is_script_wrapper_name(r->name);
+
+    if (pid == 1 || pid == 2 || pid == c->me || pid == c->my_pp) {
+        r->critical = true;
+    } else if (r->is_kernel) {
+        r->critical = true;
+    } else if (is_critical_by_name(r->name)) {
+        r->critical = true;
+    }
+
+    if (!r->critical) {
+        (void)read_cmdline_first(pid, r->cmdline0, sizeof(r->cmdline0));
+        if (is_critical_by_cmdline(r->cmdline0)) r->critical = true;
+    }
+
+    if (!r->critical && !r->is_kernel) {
+        char exepath[48];
+        snprintf(exepath, sizeof(exepath), "/proc/%d/exe", (int)pid);
+        ssize_t rl = readlink(exepath, r->exe_link, sizeof(r->exe_link) - 1);
+        if (rl < 0) rl = 0;
+        r->exe_link[rl] = 0;
+    }
+    if (!r->critical) {
+        r->is_jvm_app = looks_like_android_app_process(r);
+    }
+
+    if (!r->critical)
+        r->has_guard_task = read_environ_has_guard_task(pid);
+
+    if (!r->critical) {
+        r->is_guard_self = is_guard_app_process(cfg.appuid,
+                                                r->uid,
+                                                r->name,
+                                                r->cmdline0[0] ? r->cmdline0 : NULL);
+    }
+
+    (*c->count)++;
+    return true;
+}
+
+/* ---- 复核阶段 context + 三个回调 ---- */
+typedef struct {
+    pid_t me, my_pp;
+
+    /* 第一次遍历：统计 */
+    size_t lw, pa;
+    size_t sn;
+    pid_t  sp_pid[12];
+    char   sp_name[12][MAX_NAME];
+
+    /* 第二次遍历：收集残留 PID 用于 SIGKILL */
+    enum { MAX_LK2 = 256 };
+    size_t lk2n;
+    pid_t  lk2[MAX_LK2];
+
+    /* 第三次遍历：最终复核 */
+    size_t fl, fp;
+    size_t sn2;
+    pid_t  sn2_pid[12];
+    char   sn2_name[12][MAX_NAME];
+} CtxCheck;
+
+static bool cb_check_stat(const char *d_name, void *pctx)
+{
+    CtxCheck *c = (CtxCheck *)pctx;
+    int pidi = atoi(d_name);
+    if (pidi <= 1) return true;
+    pid_t pid2 = (pid_t)pidi;
+
+    char nm2[MAX_NAME] = {0}; pid_t pp2 = -1; uid_t ui2 = (uid_t)-1; bool is_k2 = false;
+    if (!read_proc_status(pid2, nm2, sizeof(nm2), &pp2, &ui2, &is_k2)) return true;
+    if (is_k2 || pidi == (int)c->me || pidi == (int)c->my_pp) return true;
+    if (is_critical_by_name(nm2)) return true;
+
+    bool wr2 = is_script_wrapper_name(nm2);
+    bool t2  = read_environ_has_guard_task(pid2);
+
+    if (t2 && wr2) {
+        c->lw++;
+        if (c->sn < 12) {
+            c->sp_pid[c->sn] = pid2;
+            snprintf(c->sp_name[c->sn], MAX_NAME, "%s", nm2);
+            c->sn++;
+        }
+    } else if (t2 && !wr2) {
+        c->pa++;
+    }
+    return true;
+}
+
+static bool cb_check_gather(const char *d_name, void *pctx)
+{
+    CtxCheck *c = (CtxCheck *)pctx;
+    if (c->lk2n >= MAX_LK2) return false;
+    int pidi3 = atoi(d_name);
+    if (pidi3 <= 1) return true;
+    pid_t pid3 = (pid_t)pidi3;
+    char nm3[MAX_NAME] = {0}; pid_t pp3 = -1; uid_t ui3 = (uid_t)-1; bool is_k3 = false;
+    if (!read_proc_status(pid3, nm3, sizeof(nm3), &pp3, &ui3, &is_k3)) return true;
+    if (is_k3 || pidi3 == (int)c->me || pidi3 == (int)c->my_pp) return true;
+    if (is_critical_by_name(nm3)) return true;
+    if (is_script_wrapper_name(nm3) && read_environ_has_guard_task(pid3)) {
+        c->lk2[c->lk2n++] = pid3;
+    }
+    return true;
+}
+
+static bool cb_check_final(const char *d_name, void *pctx)
+{
+    CtxCheck *c = (CtxCheck *)pctx;
+    int pidi4 = atoi(d_name);
+    if (pidi4 <= 1) return true;
+    pid_t pid4 = (pid_t)pidi4;
+    char nm4[MAX_NAME] = {0}; pid_t pp4 = -1; uid_t ui4 = (uid_t)-1; bool is_k4 = false;
+    if (!read_proc_status(pid4, nm4, sizeof(nm4), &pp4, &ui4, &is_k4)) return true;
+    if (is_k4 || pidi4 == (int)c->me || pidi4 == (int)c->my_pp) return true;
+    if (is_critical_by_name(nm4)) return true;
+    bool wr4 = is_script_wrapper_name(nm4);
+    bool t4  = read_environ_has_guard_task(pid4);
+    if (t4 && wr4) {
+        c->fl++;
+        if (c->sn2 < 12) {
+            c->sn2_pid[c->sn2] = pid4;
+            snprintf(c->sn2_name[c->sn2], MAX_NAME, "%s", nm4);
+            c->sn2++;
+        }
+    } else if (t4 && !wr4) {
+        c->fp++;
+    }
+    return true;
+}
+
 static bool read_proc_status(pid_t pid, char *name_out, size_t name_sz,
                              pid_t *ppid_out, uid_t *uid_out, bool *is_kernel_out)
 {
@@ -1203,84 +1421,13 @@ static void cleanup_script_leftovers(void)
 
     size_t count = 0;
 
-    /* ---- 1) 遍历 /proc，收集数字 PID 的快照 ---- */
-    DIR *dp = opendir("/proc");
-    if (!dp) {
-        log_msg("[脚本清理] 无法打开 /proc errno=%d，跳过\n", errno);
-        free(procs);
-        return;
-    }
-
-    struct dirent *de;
-    while ((de = readdir(dp)) != NULL) {
-        if (de->d_name[0] < '0' || de->d_name[0] > '9')
-            continue;
-        if (count >= MAX_PROC)
-            break;
-
-        int pidi = atoi(de->d_name);
-        if (pidi <= 0)
-            continue;
-
-        pid_t pid = (pid_t)pidi;
-        ProcRecord *r = &procs[count];
-        memset(r, 0, sizeof(*r));
-        r->pid = pid;
-
-        if (!read_proc_status(pid, r->name, sizeof(r->name),
-                              &r->ppid, &r->uid, &r->is_kernel))
-            continue;
-
-        /* 分类：脚本包装层 vs 其他（用于之后黑白名单） */
-        r->is_script_wrapper = is_script_wrapper_name(r->name);
-
-        /* 绝对不能碰的白名单 */
-        if (pid == 1 || pid == 2 || pid == me || pid == my_pp) {
-            r->critical = true;
-        } else if (r->is_kernel) {
-            r->critical = true;
-        } else if (is_critical_by_name(r->name)) {
-            r->critical = true;
-        }
-
-        /* cmdline 首段读出来，既用于 is_guard_self 也用于关键系统进程兜底匹配
-         * （SystemUI 等长包名 Name 字段会被截断，只能靠 cmdline 判断） */
-        if (!r->critical) {
-            (void)read_cmdline_first(pid, r->cmdline0, sizeof(r->cmdline0));
-            if (is_critical_by_cmdline(r->cmdline0)) r->critical = true;
-        }
-
-        /* /proc/<pid>/exe 符号链接（目标路径）：配合 cmdline0 / status Name 综合
-         * 判断"这是不是 Android 应用 JVM 进程"，避免 GUARD_TASK=1 继承口径把
-         * App 子进程也当成用户二进制，造成 protect_n 50/52 虚高。*/
-        if (!r->critical && !r->is_kernel) {
-            char exepath[48];
-            snprintf(exepath, sizeof(exepath), "/proc/%d/exe", (int)pid);
-            ssize_t rl = readlink(exepath, r->exe_link, sizeof(r->exe_link) - 1);
-            if (rl < 0) rl = 0;
-            r->exe_link[rl] = 0;
-        }
-        if (!r->critical) {
-            r->is_jvm_app = looks_like_android_app_process(r);
-        }
-
-        /* 主判据：GUARD_TASK 环境变量 */
-        if (!r->critical)
-            r->has_guard_task = read_environ_has_guard_task(pid);
-
-        /* 次判据：Guard 应用自身的 UI / Service 进程（包名或 app_process 主进程）
-         * 用户明确要求：触发目标应用时允许连自身 App 一起关掉，只留守护 */
-        if (!r->critical) {
-            /* cmdline0 上面已填充，无需重读 */
-            r->is_guard_self = is_guard_app_process(cfg.appuid,
-                                                    r->uid,
-                                                    r->name,
-                                                    r->cmdline0[0] ? r->cmdline0 : NULL);
-        }
-
-        count++;
-    }
-    closedir(dp);
+    /* ---- 1) 遍历 /proc，收集数字 PID 的快照 ----
+     * 使用 proc_iterate（open + SYS_getdents64）纯系统调用遍历，
+     * 完全不碰 opendir/readdir/closedir（它们在 Bionic 内部用 FILE*，
+     * FILE* 内部 pthread_mutex_t 会在 cleanup 杀完进程后被 Scudo 堆分配
+     * 器复用到已 destroy 的 mutex chunk 上触发 FORTIFY 崩溃）。*/
+    ScanCtx sctx = { procs, &count, MAX_PROC, me, my_pp };
+    (void)proc_iterate(cb_scan_main, &sctx);
 
     if (count == 0) {
         free(procs);
@@ -1561,76 +1708,26 @@ static void cleanup_script_leftovers(void)
      * 同时打印残留前 12 个样本 PID/Name，便于用户判断问题。
      * ------------------------------------------------------------- */
     {
-        DIR *dp2 = opendir("/proc");
-        size_t leftover_wrapper = 0;
-        size_t protected_alive = 0;
-        struct { pid_t pid; char name[MAX_NAME]; } samples[12];
-        size_t sample_n = 0;
-        if (dp2) {
-            struct dirent *de2;
-            while ((de2 = readdir(dp2)) != NULL) {
-                if (de2->d_name[0] < '0' || de2->d_name[0] > '9')
-                    continue;
-                int pidi = atoi(de2->d_name);
-                if (pidi <= 1) continue;
-                pid_t pid2 = (pid_t)pidi;
+        CtxCheck cc;
+        memset(&cc, 0, sizeof(cc));
+        cc.me = me; cc.my_pp = my_pp;
 
-                char nm2[MAX_NAME] = {0};
-                pid_t pp2 = -1;
-                uid_t ui2 = (uid_t)-1;
-                bool is_k2 = false;
-                if (!read_proc_status(pid2, nm2, sizeof(nm2), &pp2, &ui2, &is_k2))
-                    continue;
-                if (is_k2 || pidi == (int)me || pidi == (int)my_pp)
-                    continue;
-                if (is_critical_by_name(nm2))
-                    continue;
+        /* ---- 7) 清理后复核：第一次 /proc 遍历 ----
+         * 统计包装层残留和用户二进制存活数。*/
+        proc_iterate(cb_check_stat, &cc);
+        size_t leftover_wrapper = cc.lw;
+        size_t protected_alive  = cc.pa;
 
-                bool wr2 = is_script_wrapper_name(nm2);
-                bool t2  = read_environ_has_guard_task(pid2);
-
-                if (t2 && wr2) {
-                    leftover_wrapper++;
-                    if (sample_n < 12) {
-                        samples[sample_n].pid = pid2;
-                        snprintf(samples[sample_n].name, sizeof(samples[0].name),
-                                 "%s", nm2);
-                        sample_n++;
-                    }
-                } else if (t2 && !wr2) {
-                    protected_alive++;
-                }
-            }
-            closedir(dp2);
-        }
-
-        /* ---- 8) 兜底再清理：若仍有残留包装层，本次复核直接逐个 SIGKILL ----
-         * 原因：首轮清理（TERM→400ms→KILL）可能因"sh 在子进程退出前处于 wait/waitpid
-         * 阻塞态且 400ms 刚巧不够"或"protect 传播重置后子先死但父 sh 在信号窗内
-         * 没来得及处理"而漏。对复核时仍活的包装层残留不犹豫，直接 SIGKILL 再等
-         * 200ms 并复核一次，报告最终结果。 */
+        /* ---- 8) 兜底再清理：若仍有残留包装层，本次复核直接逐个 SIGKILL ---- */
         if (leftover_wrapper > 0) {
             size_t kill2 = 0;
-            /* 复扫一遍并 SIGKILL；先存在局部数组（readdir 过程中不宜直接改态） */
-            enum { MAX_LK2 = 256 };
-            pid_t lk2[MAX_LK2]; size_t lk2n = 0;
-            rewinddir(dp2);
-            struct dirent *de3;
-            while ((de3 = readdir(dp2)) != NULL && lk2n < MAX_LK2) {
-                if (de3->d_name[0] < '0' || de3->d_name[0] > '9') continue;
-                int pidi3 = atoi(de3->d_name);
-                if (pidi3 <= 1) continue;
-                pid_t pid3 = (pid_t)pidi3;
-                char nm3[MAX_NAME] = {0}; pid_t pp3 = -1; uid_t ui3 = (uid_t)-1; bool is_k3 = false;
-                if (!read_proc_status(pid3, nm3, sizeof(nm3), &pp3, &ui3, &is_k3)) continue;
-                if (is_k3 || pidi3 == (int)me || pidi3 == (int)my_pp) continue;
-                if (is_critical_by_name(nm3)) continue;
-                if (is_script_wrapper_name(nm3) && read_environ_has_guard_task(pid3)) {
-                    lk2[lk2n++] = pid3;
-                }
-            }
-            for (size_t i = 0; i < lk2n; i++) {
-                if (kill(lk2[i], SIGKILL) == 0) kill2++;
+
+            /* 第二次 /proc 遍历：收集残留包装层 PID */
+            cc.lk2n = 0;
+            proc_iterate(cb_check_gather, &cc);
+
+            for (size_t i = 0; i < cc.lk2n; i++) {
+                if (kill(cc.lk2[i], SIGKILL) == 0) kill2++;
             }
             struct timespec ts2;
             ts2.tv_sec = 0; ts2.tv_nsec = 200L * 1000L * 1000L;
@@ -1638,43 +1735,21 @@ static void cleanup_script_leftovers(void)
             int ws2 = 0;
             while (waitpid((pid_t)-1, &ws2, WNOHANG) > 0) {}
 
-            /* 再复核：最终残留 */
-            size_t final_leftover = 0, final_protect = 0;
-            size_t sn2 = 0;
-            rewinddir(dp2);
-            struct dirent *de4;
-            while ((de4 = readdir(dp2)) != NULL) {
-                if (de4->d_name[0] < '0' || de4->d_name[0] > '9') continue;
-                int pidi4 = atoi(de4->d_name);
-                if (pidi4 <= 1) continue;
-                pid_t pid4 = (pid_t)pidi4;
-                char nm4[MAX_NAME] = {0}; pid_t pp4 = -1; uid_t ui4 = (uid_t)-1; bool is_k4 = false;
-                if (!read_proc_status(pid4, nm4, sizeof(nm4), &pp4, &ui4, &is_k4)) continue;
-                if (is_k4 || pidi4 == (int)me || pidi4 == (int)my_pp) continue;
-                if (is_critical_by_name(nm4)) continue;
-                bool wr4 = is_script_wrapper_name(nm4);
-                bool t4  = read_environ_has_guard_task(pid4);
-                if (t4 && wr4) {
-                    final_leftover++;
-                    if (sn2 < 12) {
-                        samples[sn2].pid = pid4;
-                        snprintf(samples[sn2].name, sizeof(samples[0].name), "%s", nm4);
-                        sn2++;
-                    }
-                } else if (t4 && !wr4) {
-                    final_protect++;
-                }
-            }
+            /* 第三次 /proc 遍历：最终复核 */
+            cc.fl = 0; cc.fp = 0; cc.sn2 = 0;
+            proc_iterate(cb_check_final, &cc);
+            size_t final_leftover = cc.fl;
+            size_t final_protect  = cc.fp;
 
             if (final_leftover == 0) {
                 log_msg("[脚本清理] 复核残留 %zu 个，兜底 SIGKILL %zu 个后最终残留=0，用户二进制仍存活 %zu 个\n",
                         leftover_wrapper, kill2, final_protect);
             } else {
                 char sb2[512]; char *p2 = sb2; size_t left2 = sizeof(sb2); *p2 = '\0';
-                for (size_t i = 0; i < sn2; i++) {
+                for (size_t i = 0; i < cc.sn2; i++) {
                     int n = snprintf(p2, left2, "%s pid=%d%s",
-                                     samples[i].name, (int)samples[i].pid,
-                                     (i + 1 < sn2) ? ", " : "");
+                                     cc.sn2_name[i], (int)cc.sn2_pid[i],
+                                     (i + 1 < cc.sn2) ? ", " : "");
                     if (n <= 0 || (size_t)n >= left2) break;
                     p2 += n; left2 -= (size_t)n;
                 }
