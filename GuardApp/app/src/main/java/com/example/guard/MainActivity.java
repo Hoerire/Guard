@@ -1819,25 +1819,24 @@ public class MainActivity extends Activity {
                 if(useSu){
                     // App 进程无权读取 /data 等目录，必须在 root shell 内执行。
                     // 已预判断 binary（isElf），直接分支：
-                    // ELF 二进制 → exec 磁盘文件（必须从文件系统加载）；
-                    // sh 脚本 → stdin 管道匿名执行（脚本内容完全不落地）。
-                    // 首行 echo __GUARD_PID__=$$ 上报 sh 自身 PID，后续 exec 替换进程，PID 不变。
                     if(binary){
                         String run=
                             "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
                             "cd "+dirq+" && chmod +x "+path+" && export LD_LIBRARY_PATH="+dirq+":\"$LD_LIBRARY_PATH\" && exec "+path;
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }else{
-                        // sh 脚本：走 stdin 管道（su -c ... exec sh -s），Java 端把脚本内容
-                        // 通过 OutputStream 写入，sh 从 stdin 解析执行。磁盘上脚本文件存在
-                        // 但执行时不被直接引用（sh 的 argv[1] 不是路径），实现匿名通道。
+                        // sh 脚本：Base64 嵌在 -c 参数里执行。
+                        // 完全不依赖 stdin 管道（su -c 的 stdin 行为因实现而异不可靠），
+                        // 脚本内容也不落地（只有命令行参数里有 base64，执行完即清）。
+                        // Android 单条命令参数上限通常 > 128KB，远超普通脚本大小。
+                        String b64=java.util.Base64.getEncoder().encodeToString(java.nio.file.Files.readAllBytes(f.toPath()));
+                        // echo + 管道比 heredoc 兼容性好得多（heredoc 在某些 su -c 实现里会被吞）
+                        // base64 字符集 (A-Za-z0-9+/) 不含单引号，安全嵌入
                         String run=
                             "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
-                            "cd "+dirq+"; "+SCRIPT_ENV+"; exec /system/bin/sh -s";
+                            "cd "+dirq+"; "+SCRIPT_ENV+"; "+
+                            "echo '"+b64+"' | /system/bin/toybox base64 -d | exec /system/bin/sh";
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
-                        try(java.io.OutputStream os=p.getOutputStream()){
-                            java.nio.file.Files.copy(f.toPath(), os);
-                        }
                     }
                 }else{
                     ProcessBuilder pb;
@@ -1845,8 +1844,12 @@ public class MainActivity extends Activity {
                         f.setExecutable(true,false);
                         pb=new ProcessBuilder(f.getAbsolutePath());
                     }else{
-                        // sh 脚本：stdin 管道匿名执行
-                        pb=new ProcessBuilder("/system/bin/sh","-s");
+                        // 普通用户权限：也用 base64 嵌在 sh -c 里，避免 stdin 管道问题
+                        String b64=java.util.Base64.getEncoder().encodeToString(java.nio.file.Files.readAllBytes(f.toPath()));
+                        String run=
+                            "export GUARD_TASK=1; "+
+                            "echo '"+b64+"' | /system/bin/toybox base64 -d | exec /system/bin/sh";
+                        pb=new ProcessBuilder("/system/bin/sh","-c",run);
                     }
                     pb.directory(f.getParentFile());
                     Map<String,String> e=pb.environment();
@@ -1854,11 +1857,6 @@ public class MainActivity extends Activity {
                     e.put("LANG","en_US.UTF-8"); e.put("TERM","xterm");
                     e.put("GUARD_TASK","1");
                     p=pb.redirectErrorStream(true).start();
-                    if(!binary){
-                        try(java.io.OutputStream os=p.getOutputStream()){
-                            java.nio.file.Files.copy(f.toPath(), os);
-                        }
-                    }
                 }
                 proc[0]=p;
                 suPid[0]=pidOf(p);
