@@ -150,7 +150,7 @@ Phase 1 覆盖正常进程树中的绝大多数进程。
 
 ## 下载
 
-从 [Releases](../../releases) 页面获取最新 APK。
+从 [Releases](https://github.com/Hoerire/Guard/releases) 页面获取最新 APK。
 
 ## 使用要求
 
