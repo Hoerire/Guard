@@ -78,7 +78,7 @@ public class MainActivity extends Activity {
 
     // ===== 脚本终端 & 脚本管理 =====
     LinearLayout scriptContent, terminalContent, scriptFileBox;
-    ScrollView scriptScroll, termScroll;
+    ScrollView scriptScroll;
     TextView termOut;
     EditText termInput, scriptPathInput;
     Button termSendBtn;
@@ -1960,9 +1960,8 @@ public class MainActivity extends Activity {
         back.setOnClickListener(v->showHome());
         clear.setOnClickListener(v->termOut.setText(""));
 
-        termScroll=new ScrollView(this);
-        termScroll.setVerticalScrollBarEnabled(true);
-        termScroll.setFocusable(false);
+        // 不用 ScrollView，让 termOut 自己滚动 + 选择
+        // ScrollView 会拦截触摸事件，导致 TextView 无法长按选择
         termOut=new TextView(this);
         termOut.setTextSize(13);
         termOut.setTextColor(0xFFD8F0D8);
@@ -1970,12 +1969,14 @@ public class MainActivity extends Activity {
         termOut.setLineSpacing(dp(2),1f);
         termOut.setPadding(dp(12),dp(12),dp(12),dp(12));
         termOut.setBackground(round(0xFF10141C,dp(16)));
-        termOut.setTextIsSelectable(true);  // 支持长按选择复制终端输出
-        termOut.setLongClickable(true);
-        termScroll.addView(termOut);
+        termOut.setTextIsSelectable(true);  // 长按选择复制
+        termOut.setMovementMethod(new android.text.method.ScrollingMovementMethod());  // 触摸滚动
+        termOut.setVerticalScrollBarEnabled(true);
+        termOut.setScrollBarStyle(View.SCROLLBARS_INSIDE_OVERLAY);
+        termOut.setGravity(Gravity.TOP|Gravity.START);
         LinearLayout.LayoutParams tl=new LinearLayout.LayoutParams(-1,0,1f);
         tl.setMargins(dp(14),dp(12),dp(14),dp(4));
-        terminalContent.addView(termScroll,tl);
+        terminalContent.addView(termOut,tl);
 
         LinearLayout inputRow=new LinearLayout(this);
         inputRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -2055,7 +2056,11 @@ public class MainActivity extends Activity {
     void appendTerm(final String s){
         runOnUiThread(()->{
             termOut.append(cleanAnsi(s));
-            termScroll.post(()->termScroll.fullScroll(View.FOCUS_DOWN));
+            // 让 termOut 自己滚动到底部
+            termOut.post(()->{
+                int maxY=termOut.getLineCount()*termOut.getLineHeight()-termOut.getHeight();
+                if(maxY>0) termOut.scrollTo(0,maxY);
+            });
         });
     }
 
