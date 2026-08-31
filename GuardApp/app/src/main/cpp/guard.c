@@ -1998,15 +1998,7 @@ static bool monitor_logcat(void)
 
 static int create_config(void)
 {
-    FILE *fp = fopen(config_file, "w");
-
-    if (!fp) {
-        log_msg("[错误] 无法创建 %s errno=%d\n",
-                config_file, errno);
-        return -1;
-    }
-
-    fprintf(fp,
+    const char *default_cfg =
         "# ==================================================\n"
         "# Guard 配置\n"
         "# ==================================================\n"
@@ -2027,18 +2019,32 @@ static int create_config(void)
         "freeze:me.weishu.kernelsu\n"
         "freeze:me.bmax.apatch\n"
         "freeze:bin.mt.plus\n"
-        "freeze:bin.mt.plus.canary\n"
-    );
+        "freeze:bin.mt.plus.canary\n";
 
-    fclose(fp);
+    int fd = open(config_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd < 0) {
+        log_msg("[错误] 无法创建 %s errno=%d\n",
+                config_file, errno);
+        return -1;
+    }
 
-    // 以 root 身份创建的文件必须放开权限（0666），否则应用进程无法覆写（EACCES）
+    size_t total = strlen(default_cfg);
+    size_t written = 0;
+    while (written < total) {
+        ssize_t w = write(fd, default_cfg + written, total - written);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        written += (size_t)w;
+    }
+    close(fd);
+
     if (chmod(config_file, 0666) != 0)
         log_msg("[警告] 无法修改 %s 权限 errno=%d\n",
                 config_file, errno);
 
     log_msg("[信息] 已生成默认配置 %s\n", config_file);
-
     return 0;
 }
 
@@ -2066,9 +2072,8 @@ static int ensure_config(void)
 
 static int load_config(void)
 {
-    FILE *fp = fopen(config_file, "r");
-
-    if (!fp) {
+    int fd = open(config_file, O_RDONLY);
+    if (fd < 0) {
         log_msg("[错误] 无法打开 %s errno=%d\n",
                 config_file, errno);
         return -1;
@@ -2079,65 +2084,66 @@ static int load_config(void)
     nc.interval = DEFAULT_INTERVAL;
     nc.appuid = -1;
 
-    char line[MAX_LINE];
+    /* 整文件读入栈缓冲（MAX_OUTPUT = 64KB，远大于配置文件实际大小），
+     * 然后按 \n 切行，完全不碰 FILE* / fgets。*/
+    char buf[MAX_OUTPUT];
+    size_t total = 0;
+    while (total < sizeof(buf) - 1) {
+        ssize_t n = read(fd, buf + total, sizeof(buf) - 1 - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        total += (size_t)n;
+    }
+    buf[total] = '\0';
+    close(fd);
 
-    while (fgets(line, sizeof(line), fp)) {
+    /* 按 \n 切行解析 */
+    char *saveptr = NULL;
+    char *tok = strtok_r(buf, "\n", &saveptr);
+    while (tok) {
+        char line[MAX_LINE];
+        snprintf(line, sizeof(line), "%s", tok);
         trim(line);
 
         if (!line[0] || line[0] == '#')
-            continue;
+            goto next_line;
 
         char *sep = strchr(line, ':');
-
-        if (!sep)
-            continue;
+        if (!sep) goto next_line;
 
         *sep = '\0';
-
         char *key = line;
         char *value = sep + 1;
-
         trim(key);
         trim(value);
 
-        if (!value[0])
-            continue;
+        if (!value[0]) goto next_line;
 
         if (strcmp(key, "interval") == 0) {
             char *end = NULL;
-
-            unsigned long n =
-                strtoul(value, &end, 10);
-
-            if (end == value || *end != '\0')
-                n = DEFAULT_INTERVAL;
-
-            if (n < MIN_INTERVAL)
-                n = MIN_INTERVAL;
-
-            if (n > MAX_INTERVAL)
-                n = MAX_INTERVAL;
-
+            unsigned long n = strtoul(value, &end, 10);
+            if (end == value || *end != '\0') n = DEFAULT_INTERVAL;
+            if (n < MIN_INTERVAL) n = MIN_INTERVAL;
+            if (n > MAX_INTERVAL) n = MAX_INTERVAL;
             nc.interval = (unsigned int)n;
-        }
-        else if (strcmp(key, "appuid") == 0) {
+        } else if (strcmp(key, "appuid") == 0) {
             char *end = NULL;
             long n = strtol(value, &end, 10);
-            if (end == value || *end != '\0')
-                n = -1;
+            if (end == value || *end != '\0') n = -1;
             nc.appuid = (int)n;
-        }
-        else if (strcmp(key, "target") == 0) {
+        } else if (strcmp(key, "target") == 0) {
             if (!add_target(&nc, value))
                 log_msg("[警告] 忽略非法 target：%s\n", value);
-        }
-        else if (strcmp(key, "freeze") == 0) {
+        } else if (strcmp(key, "freeze") == 0) {
             if (!add_freeze(&nc, value))
                 log_msg("[警告] 忽略非法 freeze：%s\n", value);
         }
+    next_line:
+        tok = strtok_r(NULL, "\n", &saveptr);
     }
-
-    fclose(fp);
 
     // 互斥保护：同一应用不能同时是 target 和 freeze（禁用正在进入的应用无意义）
     for (size_t i = 0; i < nc.freeze_count;) {
@@ -2208,92 +2214,41 @@ static bool reload_if_changed(void)
 
 int main(int argc, char **argv)
 {
-    /* ==== Phase 0：fork + exec self，彻底脱离祖先 pthread 状态 ====
+    /* ==== Phase 0：double-fork daemonize + setsid ====
      *
      * 守护进程被 Java 端通过 `nohup guard cfg > guard.log 2>&1 &` 启动，
-     * 链路是 Java App → su → sh → nohup → fork → exec guard。
+     * 链路是 Java App → su → sh → nohup → 最终 exec guard。
      *
-     * 根因：进程从 sh/nohup fork 出来时，**libc 内部 pthread_mutex_t 是在
-     * 父进程堆里初始化过的对象被 memcpy 复制过来**。父进程里这些 mutex 已
-     * 经经历过 init/lock/unlock/destroy，fork 后在守护进程里呈现"已初始化
-     * 但无线程真正持有"的悬空状态。cleanup 杀完一批进程触发 Scudo 堆分配
-     * 器复用同一 chunk 时，新对象的 mutex 初始化与旧 destroy 状态竞争 →
-     * Bionic FORTIFY "pthread_mutex_lock called on a destroyed mutex" →
-     * raise(SIGABRT) → 守护崩溃。
+     * 为什么还要自己 fork 一次：确保我们被 init（ppid=1）接管，后续
+     * pgrep/kill-0 精准确认存活不被 shell 链路干扰。
      *
-     * 解法：先检查环境变量 GUARD_DEMONIZED=1（标记已经 exec 过一次）。
-     * 若未设置 → fork → 子进程设置 GUARD_DEMONIZED=1 + execve("/proc/self/exe",
-     * argv, environ)。execve 是关键：它让内核重新把我们的 ELF 加载到新地址空间，
-     * 同时 Bionic libc 从零初始化，所有 pthread_mutex_t 干净无状态，不再继承
-     * 任何祖先悬空锁。execve 后我们的地址空间完全是自己的，不再有 su/java/
-     * sh 进程的堆/栈/环境污染。
+     * 为什么不用 fork+exec self：那套自举机制的初衷是"重置 libc pthread 状态"，
+     * 但经过多轮重构，我们已经把守护内部所有 FILE*（opendir/fopen/fprintf/fgets）
+     * 全部换成了纯系统调用（open/read/write/SYS_getdents64），从根源上消除了
+     * Bionic FORTIFY "pthread_mutex_lock on destroyed mutex" 触发点。exec self
+     * 反而增加了 SELinux/SEPolicy 拦截风险 + 启动复杂度，直接干掉。
      *
-     * fork 父进程（nohup/shell 的子进程）在 exec 前就 _exit()，让 init 接
-     * 管子进程（ppid=1），Java 端后续 pgrep/kill-0 能正确找到我们。
-     *
-     * 为什么不只用 setsid？setsid 只改变 session/group 归属，不影响内存；
-     * pthread 状态还是从父进程复制过来。必须 exec() 才能让内核重新初始化
-     * 整个 C 运行时。
-     *
-     * 为什么环境变量而不是 argv？argv 被 Java 端固定传 "config_path"，
-     * 加 "--daemon" 后缀需要同步改 Java 端；环境变量更干净，不需要改调用方。
+     * 为什么要 atexit → 去掉：atexit 内部也走 libc 的 mutex 链，在 Scudo/ASan
+     * 插桩下可能跟 FORTIFY 冲突。remove_pidfile 已在 signal_handler 和
+     * crash_handler 里调用，正常退出路径再覆盖一次足够。
      */
-    const char *already_daemon = getenv("GUARD_DEMONIZED");
-    if (!already_daemon || strcmp(already_daemon, "1") != 0) {
-        pid_t p = fork();
-        if (p < 0) {
-            /* fork 失败，原始 stderr 还可用（此时还没 exec 也没重定向），
-             * 用 raw_write(fd=2) 直接写系统调用，不碰 FILE*。*/
-            raw_write(2, "[Guard][FATAL] pre-daemon fork failed: ");
-            raw_write_i(2, errno); raw_write(2, "\n");
-            return 1;
-        }
-        if (p > 0) {
-            /* 父进程 = Java 端 nohup/shell fork 出来的第一层。
-             * 它的 ppid 就是 nohup/shell，立即退出让 init 接管子进程。
-             * 不能 exit()，要用 _exit() 跳过 atexit/stdio cleanup 以免
-             * 触发我们还没来得及 exec 的悬空 pthread 锁。*/
-            _exit(0);
-        }
-        /* 子进程：setsid() 成新 session leader，断开控制终端 */
-        (void)setsid();
+    pid_t f1 = fork();
+    if (f1 < 0) { raw_write(2, "[Guard][FATAL] fork fail errno="); raw_write_i(2, errno); raw_write(2, "\n"); return 1; }
+    if (f1 > 0) _exit(0);              /* 第一层父进程立即退出 */
 
-        /* 继承环境变量 + 追加 GUARD_DEMONIZED=1，防止 exec 后无限循环 */
-        setenv("GUARD_DEMONIZED", "1", 1);
+    (void)setsid();                    /* 新 session leader，脱离终端 */
 
-        /* 立即 exec 自己：/proc/self/exe 是内核提供的自引用，
-         * 不管原始可执行文件是什么都能正确找到我们自己。
-         * exec 后 Bionic libc 重新加载，pthread mutex 全部零初始化。
-         *
-         * 环境变量保留原始 environ + GUARD_DEMONIZED=1（setenv 已修改过），
-         * 确保后续 popen("logcat", "r") 能找到 PATH，pm/cmd 等命令也正常。*/
-        execve("/proc/self/exe", argv, environ);
+    pid_t f2 = fork();
+    if (f2 < 0) { raw_write(2, "[Guard][FATAL] fork2 fail errno="); raw_write_i(2, errno); raw_write(2, "\n"); return 1; }
+    if (f2 > 0) _exit(0);              /* 第二层父进程退出，init 接管我们 */
 
-        /* execve 失败（极少见：权限/SELinux/文件被删），用 raw_write 到 fd=2
-         * 告诉 Java 端，然后 _exit 不用 exit()。*/
-        raw_write(2, "[Guard][FATAL] execve self failed: ");
-        raw_write_i(2, errno); raw_write(2, "\n");
-        _exit(1);
-    }
-
-    /* 到这里，GUARD_DEMONIZED=1 说明我们已经是 exec 后的纯净守护：
-     *   - 被 init 接管（ppid=1）
-     *   - 独立 session leader（setsid）
-     *   - Bionic libc 刚从 exec 加载，pthread mutex 全干净
-     *   - 唯一的内存来源是我们自己的 ELF + 干净的 C 运行时 */
-
-    /* 重定向 stdin/stdout/stderr 到 /dev/null，断开 exec 前的 fd 继承。
-     * 守护日志完全走 log_msg() → write(log_fd, …)，不碰 stdio。*/
+    /* 重定向 stdin/stdout/stderr 到 /dev/null，断开继承的 fd */
     {
         int dn = open("/dev/null", O_RDWR);
         if (dn >= 0) {
-            dup2(dn, 0);
-            dup2(dn, 1);
-            dup2(dn, 2);
+            dup2(dn, 0); dup2(dn, 1); dup2(dn, 2);
             if (dn > 2) close(dn);
-        } else {
-            close(0); close(1); close(2);
-        }
+        } else { close(0); close(1); close(2); }
     }
 
     if (argc >= 2 && argv[1] && argv[1][0])
@@ -2311,7 +2266,6 @@ int main(int argc, char **argv)
         if (cl + strlen(".pid") + 1 <= sizeof(pid_file)) {
             memcpy(pid_file, config_file, cl);
             memcpy(pid_file + cl, ".pid", 5);
-            atexit(remove_pidfile);
         }
         if (cl + strlen(".crash") + 1 <= sizeof(crash_file)) {
             memcpy(crash_file, config_file, cl);
