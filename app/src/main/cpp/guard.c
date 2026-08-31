@@ -617,6 +617,34 @@ static bool prefix_match(const char *comp, size_t clen,
     return (c == '\0' || c == '/' || c == '.');
 }
 
+// 验证组件名是否为合法的应用包名
+// 过滤输入法、系统覆盖层等非应用窗口（名称含非 ASCII 字符或格式异常）
+static bool is_valid_app_component(const char *comp)
+{
+    if (!comp || !comp[0])
+        return false;
+
+    int dot_count = 0;
+
+    for (const char *p = comp; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+
+        // 非 ASCII 字符 → 输入法/系统窗口，跳过
+        if (c > 127)
+            return false;
+
+        if (c == '.')
+            dot_count++;
+    }
+
+    // 合法包名至少包含 2 个点（如 com.example.app）
+    // 输入法窗口通常格式异常（如 l.ۡ᩸᩷）
+    if (dot_count < 2)
+        return false;
+
+    return true;
+}
+
 static bool comp_matches(const char *comp,
                          const Package *list,
                          size_t count)
@@ -647,22 +675,38 @@ static bool comp_matches(const char *comp,
 }
 
 // 检测系统中是否有应用处于小窗（PiP）模式
-// 使用 dumpsys window 检查是否存在 PiP 窗口
+// 检查 dumpsys window 和 activity 两个来源
 static bool is_pip_active(void)
 {
     char out[8192];
-    const char *argv[] = {
+
+    // 方式1：检查 window 中的 PiP 窗口
+    const char *argv1[] = {
         "/system/bin/sh", "-c",
-        "dumpsys window 2>/dev/null | grep -ic 'pip'",
+        "/system/bin/dumpsys window 2>/dev/null | /system/bin/grep -ic 'pip'",
         NULL
     };
 
-    if (exec_cmd_rc(out, sizeof(out), argv) < 0)
-        return false;
+    if (exec_cmd_rc(out, sizeof(out), argv1) >= 0) {
+        trim(out);
+        if (atoi(out) > 0)
+            return true;
+    }
 
-    trim(out);
-    int count = atoi(out);
-    return count > 0;
+    // 方式2：检查 activity 中的 PiP 任务
+    const char *argv2[] = {
+        "/system/bin/sh", "-c",
+        "/system/bin/dumpsys activity activities 2>/dev/null | /system/bin/grep -ic 'pip\\|picture.in.picture'",
+        NULL
+    };
+
+    if (exec_cmd_rc(out, sizeof(out), argv2) >= 0) {
+        trim(out);
+        if (atoi(out) > 0)
+            return true;
+    }
+
+    return false;
 }
 
 static void handle_event(const char *line)
@@ -682,6 +726,10 @@ static void handle_event(const char *line)
     char comp[MAX_PKG];
 
     if (!extract_component(line, comp, sizeof(comp)))
+        return;
+
+    // 过滤输入法、系统覆盖层等非应用窗口
+    if (!is_valid_app_component(comp))
         return;
 
     // 每次事件先检查配置文件是否被修改，修改则热重载，
