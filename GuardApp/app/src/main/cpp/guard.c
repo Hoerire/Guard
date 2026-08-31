@@ -18,6 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/syscall.h>   /* SYS_getdents64 + syscall() */
+#include <sys/mman.h>      /* mmap/munmap —— 绕开 Scudo 堆分配器 */
 /* linux_dirent64 结构 —— NDK 没提供 <linux/dirent.h>，自己定义一份。
  * 对应内核的 struct linux_dirent64，d_reclen 是内核实际写入的记录长度。*/
 struct linux_dirent64 {
@@ -1012,19 +1013,22 @@ static bool read_environ_has_guard_task(pid_t pid)
     if (fd < 0)
         return false;
 
-    /* 16KB 缓冲改用堆分配，避免 NDK stack protector 对大栈数组的误触发 */
+    /* 16KB 缓冲用 mmap（Scudo 管 malloc 不管 mmap），
+     * 绕开父进程多线程 fork 继承导致的 Scudo 悬空锁触发 FORTIFY */
     enum { ENV_BUF_SZ = 16384 };
-    char *buf = (char *)calloc(1, ENV_BUF_SZ);
-    if (!buf) {
+    void *mbuf = mmap(NULL, ENV_BUF_SZ, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mbuf == MAP_FAILED) {
         close(fd);
         return false;
     }
+    char *buf = (char *)mbuf;
 
     ssize_t n = read(fd, buf, ENV_BUF_SZ - 1);
     close(fd);
 
     if (n <= 0) {
-        free(buf);
+        munmap(mbuf, ENV_BUF_SZ);
         return false;
     }
 
@@ -1034,19 +1038,20 @@ static bool read_environ_has_guard_task(pid_t pid)
     const char *p = buf;
     const char *end = buf + n;
 
+    bool found = false;
     while (p < end) {
         size_t seg_len = strnlen(p, (size_t)(end - p));
         if (seg_len == 0)
             break;
         if (strncmp(p, "GUARD_TASK=", 11) == 0) {
-            free(buf);
-            return true;
+            found = true;
+            break;
         }
         p += seg_len + 1;
     }
 
-    free(buf);
-    return false;
+    munmap(mbuf, ENV_BUF_SZ);
+    return found;
 }
 
 /* 读取 /proc/<pid>/cmdline 的 argv[0]（NUL 分隔首段），最多写入 out_sz-1 字节，
@@ -1413,11 +1418,17 @@ static void cleanup_script_leftovers(void)
     pid_t me     = getpid();
     pid_t my_pp  = getppid();
 
-    ProcRecord *procs = calloc(MAX_PROC, sizeof(ProcRecord));
-    if (!procs) {
+    /* 全部用 mmap（MAP_PRIVATE|MAP_ANONYMOUS），不碰 malloc！
+     * Scudo 堆分配器只管 malloc/calloc/realloc，不管内核 mmap。
+     * 这样即使 Scudo 从多线程父进程继承了悬空锁，我们也永远不会触发它。*/
+    size_t procs_bytes = MAX_PROC * sizeof(ProcRecord);
+    ProcRecord *procs = (ProcRecord *)mmap(NULL, procs_bytes, PROT_READ | PROT_WRITE,
+                                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (procs == MAP_FAILED) {
         log_msg("[脚本清理] 内存不足，跳过\n");
         return;
     }
+    memset(procs, 0, procs_bytes);
 
     size_t count = 0;
 
@@ -1430,7 +1441,7 @@ static void cleanup_script_leftovers(void)
     (void)proc_iterate(cb_scan_main, &sctx);
 
     if (count == 0) {
-        free(procs);
+        munmap(procs, procs_bytes);
         return;
     }
 
@@ -1446,12 +1457,15 @@ static void cleanup_script_leftovers(void)
      *     则子也被 kill，用来连带清包装层启动的短生命工具（cat/grep/sed 等），
      *     但不会穿透到被 protect 的用户二进制后代。
      * ---------------------------------------------------- */
-    bool *kill_flag = calloc(count, sizeof(bool));
-    if (!kill_flag) {
+    size_t kf_bytes = MAX_PROC * sizeof(bool);
+    bool *kill_flag = (bool *)mmap(NULL, kf_bytes, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (kill_flag == MAP_FAILED) {
         log_msg("[脚本清理] 内存不足，跳过\n");
-        free(procs);
+        munmap(procs, procs_bytes);
         return;
     }
+    memset(kill_flag, 0, kf_bytes);
 
     /* ---- Phase B：白名单最小集合（仅"真实用户原生二进制正本"）----
      * 用户明确口径：除了 Guard 守护程序本身 + 用户执行的二进制程序，其余全杀。
@@ -1566,13 +1580,21 @@ static void cleanup_script_leftovers(void)
     } while (kill_changed);
 
     /* ---- 3) 深度层级，按深度从大到小排序，保证先杀子再杀父 ---- */
-    int  *depth  = calloc(count, sizeof(int));
-    int  *order  = calloc(count, sizeof(int));
-    if (!depth || !order) {
+    size_t int_bytes = MAX_PROC * sizeof(int);
+    int *depth = (int *)mmap(NULL, int_bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int *order = (int *)mmap(NULL, int_bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (depth == MAP_FAILED || order == MAP_FAILED) {
         log_msg("[脚本清理] 内存不足，跳过\n");
-        free(depth); free(order); free(kill_flag); free(procs);
+        if (depth != MAP_FAILED) munmap(depth, int_bytes);
+        if (order != MAP_FAILED) munmap(order, int_bytes);
+        munmap(kill_flag, kf_bytes);
+        munmap(procs, procs_bytes);
         return;
     }
+    memset(depth, 0, int_bytes);
+    memset(order, 0, int_bytes);
 
     for (size_t i = 0; i < count; i++) {
         order[i] = (int)i;
@@ -1611,15 +1633,21 @@ static void cleanup_script_leftovers(void)
      * 非脚本包装层）。祖先链传播得到的 protect 副本/App UI/critical 不算在内，
      * 否则会把同一次清理的保护数虚高，并随调用次数/脚本累积显得"越来越多"，
      * 对用户判断自己后台二进制是否都被保护造成误导。 */
-    pid_t *kill_list = calloc(MAX_PROC, sizeof(pid_t));
+    size_t kl_bytes = MAX_PROC * sizeof(pid_t);
+    pid_t *kill_list = (pid_t *)mmap(NULL, kl_bytes, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     size_t kill_n = 0;
     size_t protect_n = 0;
     size_t protect_raw_n = 0;
-    if (!kill_list) {
+    if (kill_list == MAP_FAILED) {
         log_msg("[脚本清理] 内存不足，跳过\n");
-        free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
+        munmap(depth, int_bytes);
+        munmap(order, int_bytes);
+        munmap(kill_flag, kf_bytes);
+        munmap(procs, procs_bytes);
         return;
     }
+    memset(kill_list, 0, kl_bytes);
 
     for (size_t oi = 0; oi < count; oi++) {
         size_t idx = (size_t)order[oi];
@@ -1667,7 +1695,11 @@ static void cleanup_script_leftovers(void)
 
     if (kill_n == 0) {
         log_msg("[脚本清理] 无可清理残留（白名单保护 %zu 个用户管理进程），跳过\n", protect_n);
-        free(kill_list); free(depth); free(order); free(kill_flag); free(procs);
+        munmap(kill_list, kl_bytes);
+        munmap(depth, int_bytes);
+        munmap(order, int_bytes);
+        munmap(kill_flag, kf_bytes);
+        munmap(procs, procs_bytes);
         return;
     }
 
@@ -1762,11 +1794,11 @@ static void cleanup_script_leftovers(void)
         }
     }
 
-    free(kill_list);
-    free(depth);
-    free(order);
-    free(kill_flag);
-    free(procs);
+    munmap(kill_list, kl_bytes);
+    munmap(depth, int_bytes);
+    munmap(order, int_bytes);
+    munmap(kill_flag, kf_bytes);
+    munmap(procs, procs_bytes);
 }
 
 static void handle_event(const char *line)
