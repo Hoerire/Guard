@@ -65,7 +65,10 @@ public class MainActivity extends Activity {
 
     volatile boolean rootGranted=false, rootChecked=false, serviceRunning=false;
     volatile boolean logAtBottom=true;
+    volatile boolean serviceRedirectMode=false;
     Process serviceProc=null;
+    Thread logTailThread=null;
+    volatile long logTailOffset=0;
     final StringBuilder logBuffer=new StringBuilder();
 
     // ===== 脚本终端 & 脚本管理 =====
@@ -264,6 +267,7 @@ public class MainActivity extends Activity {
         logView=new TextView(this);
         logView.setTextSize(12); logView.setTextColor(SUBTEXT);
         logView.setTypeface(Typeface.MONOSPACE);
+        logView.setTextIsSelectable(true);
         logView.setPadding(dp(2),dp(8),dp(2),dp(4));
         logScroll.addView(logView);
         LinearLayout.LayoutParams lslp=new LinearLayout.LayoutParams(-1,dp(190));
@@ -749,14 +753,19 @@ public class MainActivity extends Activity {
                 File exe=ensureBinary();
                 String q=shq(exe.getAbsolutePath());
                 String cfg=shq(cfgFile.getAbsolutePath());
-                String cmd="chmod 755 "+q+" ; "+q+" "+cfg;
+                String logPath=shq(logFile.getAbsolutePath());
+                // stderr 直接重定向到日志文件，确保 UI 被禁用、app 进程被杀后日志仍持续写入
+                String cmd="chmod 755 "+q+" ; "+q+" "+cfg+" 2>>"+logPath;
                 final Process p=new ProcessBuilder("su","-c",cmd).redirectErrorStream(true).start();
                 serviceProc=p;
+                serviceRedirectMode=true;
                 runOnUiThread(()->{
                     serviceRunning=true; updateStatus();
                     appendLog("[系统] 服务进程已启动，配置："+cfgFile.getAbsolutePath());
                     showFloat("服务已启动");
                 });
+                // 启动文件尾随线程，实时读取二进制写入的日志并显示
+                startLogTail();
                 BufferedReader r=new BufferedReader(new InputStreamReader(p.getInputStream()));
                 String line;
                 while((line=r.readLine())!=null){
@@ -766,8 +775,10 @@ public class MainActivity extends Activity {
                         if(idx>0) line=line.substring(idx+2);
                     }
                     if(line.isEmpty()) continue;
-                    appendLog(line);
+                    displayLog(line);
                 }
+                stopLogTail();
+                serviceRedirectMode=false;
                 runOnUiThread(()->{
                     serviceRunning=false; updateStatus();
                     appendLog("[系统] 服务已退出");
@@ -780,6 +791,8 @@ public class MainActivity extends Activity {
     }
 
     void stopService(){
+        stopLogTail();
+        serviceRedirectMode=false;
         appendLog("[系统] 正在停止服务…");
         showFloat("服务已停止");
         runRoot("pkill -TERM -x Guard","已发送停止信号");
@@ -841,6 +854,7 @@ public class MainActivity extends Activity {
         // 在调用线程取时（更贴近事件发生时刻），并精确到毫秒
         final String ts=new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date());
         final String entry="["+ts+"] "+line+"\n";
+        // 应用自身日志始终写入文件（二进制输出由 stderr 重定向直接写入，不经过此处）
         writeLogFile(entry);
         runOnUiThread(()->{
             logBuffer.append(entry);
@@ -850,12 +864,83 @@ public class MainActivity extends Activity {
         });
     }
 
+    // 仅更新 UI，不写入文件（文件由二进制 stderr 重定向直接写入）
+    void displayLog(final String line){
+        final String ts=new SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault()).format(new Date());
+        final String entry="["+ts+"] "+line+"\n";
+        runOnUiThread(()->{
+            logBuffer.append(entry);
+            if(logBuffer.length()>30000) logBuffer.delete(0,15000);
+            logView.setText(logBuffer.toString());
+            if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+        });
+    }
+
+    // 启动文件尾随线程：实时读取二进制写入日志文件的新内容并显示
+    void startLogTail(){
+        stopLogTail();
+        logTailOffset=logFile.exists()?logFile.length():0;
+        logTailThread=new Thread(()->{
+            try{
+                RandomAccessFile raf=new RandomAccessFile(logFile,"r");
+                raf.seek(logTailOffset);
+                while(serviceRunning&&!Thread.interrupted()){
+                    try{
+                        long len=raf.length();
+                        if(len<logTailOffset){
+                            // 文件被截断（trimLogFile），重新从头开始
+                            raf.seek(0);
+                            logTailOffset=0;
+                            continue;
+                        }
+                        if(len>logTailOffset){
+                            int sz=(int)(len-logTailOffset);
+                            byte[] data=new byte[sz];
+                            raf.readFully(data);
+                            logTailOffset=len;
+                            String content=new String(data,"UTF-8");
+                            for(String ln:content.split("\n")){
+                                ln=ln.trim();
+                                if(ln.isEmpty()) continue;
+                                // 只处理二进制原始输出（带完整日期前缀 [20...]）
+                                if(ln.startsWith("[20")){
+                                    int idx=ln.indexOf("] ");
+                                    if(idx>0) ln=ln.substring(idx+2);
+                                    if(ln.isEmpty()) continue;
+                                    displayLog(ln);
+                                }
+                                // 跳过应用自身写入的日志（[HH:mm:ss] 格式，已由 appendLog 显示）
+                            }
+                        }
+                    }catch(Exception ignored){
+                        // 单次读取失败（文件被截断等），重新定位
+                        try{ raf.close(); }catch(Exception e2){}
+                        raf=new RandomAccessFile(logFile,"r");
+                        logTailOffset=raf.length();
+                        raf.seek(logTailOffset);
+                    }
+                    Thread.sleep(100);
+                }
+                raf.close();
+            }catch(Exception ignored){}
+        });
+        logTailThread.start();
+    }
+
+    void stopLogTail(){
+        if(logTailThread!=null){
+            logTailThread.interrupt();
+            logTailThread=null;
+        }
+    }
+
     void clearLog(){
         logBuffer.setLength(0);
         logView.setText("");
         synchronized(logLock){
             try{ if(logFile.exists()) logFile.delete(); }catch(Exception ignored){}
         }
+        logTailOffset=0;
     }
 
     // ==================== 日志持久化 ====================
@@ -905,9 +990,12 @@ public class MainActivity extends Activity {
             fis.close();
             String content=new String(data,"UTF-8");
             if(content.isEmpty()) return;
+            // 统一时间戳格式：二进制原始输出 [2026-08-31 17:45:11.742] → 应用格式 [17:45:11.742]
+            content=content.replaceAll("\\[\\d{4}-\\d{2}-\\d{2} (\\d{2}:\\d{2}:\\d{2}\\.\\d{3})\\]", "[$1]");
             logBuffer.append(content);
             logView.setText(logBuffer.toString());
-            if(logAtBottom) logScroll.post(()->logScroll.fullScroll(View.FOCUS_DOWN));
+            // 始终滚到底部显示最新日志
+            logScroll.postDelayed(()->logScroll.fullScroll(View.FOCUS_DOWN),100);
         }catch(Exception ignored){}
     }
 
@@ -1550,6 +1638,8 @@ public class MainActivity extends Activity {
 
     @Override protected void onDestroy(){
         super.onDestroy();
+        stopLogTail();
+        serviceRedirectMode=false;
         if(termProc!=null){ try{ termProc.destroy(); }catch(Exception ignored){} termProc=null; termIn=null; }
     }
 
