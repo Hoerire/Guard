@@ -1415,390 +1415,46 @@ static bool read_proc_status(pid_t pid, char *name_out, size_t name_sz,
 
 static void cleanup_script_leftovers(void)
 {
-    pid_t me     = getpid();
-    pid_t my_pp  = getppid();
+    /* 极简实现：守护进程自己不再做任何 /proc 扫描或堆分配。
+     * 只 fork 一个子进程让它 exec /system/bin/sh -c '<清理脚本>'。
+     * 清理脚本在全新的 sh 进程里跑，完全不受守护进程继承的 libc 状态影响。
+     * 这彻底规避了 Scudo/Thread/FORTIFY 因父进程（su）多线程状态残留导致的崩溃。 */
 
-    /* 全部用 mmap（MAP_PRIVATE|MAP_ANONYMOUS），不碰 malloc！
-     * Scudo 堆分配器只管 malloc/calloc/realloc，不管内核 mmap。
-     * 这样即使 Scudo 从多线程父进程继承了悬空锁，我们也永远不会触发它。*/
-    size_t procs_bytes = MAX_PROC * sizeof(ProcRecord);
-    ProcRecord *procs = (ProcRecord *)mmap(NULL, procs_bytes, PROT_READ | PROT_WRITE,
-                                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (procs == MAP_FAILED) {
-        log_msg("[脚本清理] 内存不足，跳过\n");
-        return;
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* 子进程：exec 前先设 GUARD_TASK=0 避免自己被脚本匹配 */
+        setenv("GUARD_TASK", "0", 1);
+
+        /* 清理脚本：遍历 /proc，找出有 GUARD_TASK=1 且是 shell 包装层的进程，
+         * 先 SIGTERM，等 500ms，再 SIGKILL。
+         *
+         * 为什么只杀 shell 包装层（sh/su/toybox/toolbox/dash/bash/mksh/zsh）？
+         *   因为用户的二进制程序（ELF）也有 GUARD_TASK=1，但它们的 comm/name
+         *   不是 shell 类型。所以只杀 shell 类就能把整个脚本执行链清干净，
+         *   同时保证用户后台二进制不会被误杀。*/
+        const char *cleanup_sh =
+            "kill_one() { pid=$1; [ -z "$pid" ] && return; "
+            "nm=$(cat /proc/$pid/comm 2>/dev/null) || return; "
+            "case "$nm" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) return ;; esac; "
+            "tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -TERM $pid 2>/dev/null; } "
+            "for p in /proc/[0-9]*; do kill_one "${p##*/}"; done; "
+            "sleep 0.5; "
+            "for p in /proc/[0-9]*; do "
+            "  pid=${p##*/}; "
+            "  nm=$(cat /proc/$pid/comm 2>/dev/null) || continue; "
+            "  case "$nm" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) continue ;; esac; "
+            "  tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -KILL $pid 2>/dev/null; "
+            "done";
+
+        execl("/system/bin/sh", "sh", "-c", cleanup_sh, (char *)NULL);
+        /* exec 失败时直接 _exit，不要走到父进程的清理逻辑 */
+        _exit(127);
+    } else if (pid > 0) {
+        /* 父进程：不 wait，让 sh 自己跑完就好 */
+        log_msg("[脚本清理] 已派发 sh 清理子进程 PID=%d\n", (int)pid);
+    } else {
+        log_msg("[脚本清理] fork 失败：%s\n", strerror(errno));
     }
-    memset(procs, 0, procs_bytes);
-
-    size_t count = 0;
-
-    /* ---- 1) 遍历 /proc，收集数字 PID 的快照 ----
-     * 使用 proc_iterate（open + SYS_getdents64）纯系统调用遍历，
-     * 完全不碰 opendir/readdir/closedir（它们在 Bionic 内部用 FILE*，
-     * FILE* 内部 pthread_mutex_t 会在 cleanup 杀完进程后被 Scudo 堆分配
-     * 器复用到已 destroy 的 mutex chunk 上触发 FORTIFY 崩溃）。*/
-    ScanCtx sctx = { procs, &count, MAX_PROC, me, my_pp };
-    (void)proc_iterate(cb_scan_main, &sctx);
-
-    if (count == 0) {
-        munmap(procs, procs_bytes);
-        return;
-    }
-
-    /* ---- 2) 保护白名单 + 清理种子 + 递归后代 ----
-     *   白名单保护（Phase B）：如果一个进程 GUARD_TASK=1 且它不是包装层，
-     *     说明它是用户通过脚本主动启动的"管理类二进制"（后台常驻程序），
-     *     这类绝不能杀；同时将其**祖先链**（沿 ppid 往上直到 init/找不到）
-     *     也一并打白标，避免杀父 sh 触发 SIGHUP 误伤。
-     *   清理种子（Phase C）：只有「GUARD_TASK=1 且 is_script_wrapper=1」的
-     *     进程 + 「is_guard_self=1」的 App UI 进程会被标记 kill_flag（守护自己
-     *     本来就是 critical=1，已经排除，不会被杀）。
-     *   后代扩散（Phase D）：BFS 方式：父被 kill 且子 !critical && !protect，
-     *     则子也被 kill，用来连带清包装层启动的短生命工具（cat/grep/sed 等），
-     *     但不会穿透到被 protect 的用户二进制后代。
-     * ---------------------------------------------------- */
-    size_t kf_bytes = MAX_PROC * sizeof(bool);
-    bool *kill_flag = (bool *)mmap(NULL, kf_bytes, PROT_READ | PROT_WRITE,
-                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (kill_flag == MAP_FAILED) {
-        log_msg("[脚本清理] 内存不足，跳过\n");
-        munmap(procs, procs_bytes);
-        return;
-    }
-    memset(kill_flag, 0, kf_bytes);
-
-    /* ---- Phase B：白名单最小集合（仅"真实用户原生二进制正本"）----
-     * 用户明确口径：除了 Guard 守护程序本身 + 用户执行的二进制程序，其余全杀。
-     * protect 条件（必须全部满足）：
-     *   ① !critical  —— 不跟系统底线白名单冲突
-     *   ② has_guard_task = 1 —— 脚本血统（环境变量由 Java 端 export 给脚本及其后代）
-     *   ③ !is_script_wrapper —— 不是 sh/su/toybox/toolbox…等脚本包装层
-     *   ④ !is_jvm_app —— 不是 app_process / dalvikvm / art 等 JVM 启动的 Android App
-     *                     （脚本里通过 am/app_process 拉起 App 组件时会继承 GUARD_TASK=1，
-     *                      这一类不算"用户二进制"，否则 protect_n 会虚高到 50/52，
-     *                      同时误让一堆 App 进程逃脱清理）
-     *   ⑤ 可选兜底：/proc/<pid>/exe 能读到且不是 /system/bin /system/xbin /vendor/bin
-     *                分区里的标准系统工具；这一步用来进一步把 toybox 多工具名、
-     *                am/pm/cmd/wm/settings 等 Java wrapper 的 shell 形态排除。
-     *   不再做「子被保护 -> 父也保护」的祖先链传播。父 sh / 中间 su / 过渡 exec
-     *   全部属于"其余"，严格模式下必须清理。 */
-    for (size_t i = 0; i < count; i++) {
-        ProcRecord *r = &procs[i];
-        if (r->critical) continue;
-        if (!r->has_guard_task) continue;
-        if (r->is_script_wrapper) continue;
-        if (r->is_jvm_app) continue;
-        /* 兜底：如果 exe 链接指向系统分区 (/system|/vendor|/product|/apex) 里的
-         * 已知工具路径，说明它其实是"被脚本继承了 GUARD_TASK 的系统工具短命
-         * 令"，不应当算用户二进制。典型：/system/bin/toybox、/system/bin/cmd、
-         * /system/bin/sh、/system/bin/app_process64 等。 */
-        if (r->exe_link[0]) {
-            static const char *const sys_prefixes[] = {
-                "/system/bin/", "/system/xbin/", "/vendor/bin/",
-                "/product/bin/", "/apex/com.android.", NULL
-            };
-            bool in_sys = false;
-            for (size_t k = 0; sys_prefixes[k]; k++) {
-                size_t pl = strlen(sys_prefixes[k]);
-                if (strncmp(r->exe_link, sys_prefixes[k], pl) == 0) {
-                    in_sys = true; break;
-                }
-            }
-            if (in_sys) continue;
-        }
-        r->protect = true;
-    }
-
-    /* ---- Phase C：打 kill_flag 种子（严格模式 = 除了 critical + protect 之外，
-     *   只杀"明确属于脚本/App 血统"的进程）。
-     *
-     *  ⚠️ 已移除旧方案 (d)「uid>=AID_APP (10000) 全部作兜底种子」：
-     *  /proc/<pid>/status 的 Name 字段最长 15 字节，像 com.android.systemui 会被
-     *  截断成 "com.android.sy"，旧的 is_critical_by_name() 仅按短名匹配，导致
-     *  SystemUI/Settings/Launcher 等长包名系统 App 从 critical 网里漏掉，再叠加
-     *  10000 兜底就会连带一起 kill，出现用户反馈"系统界面直接被重启"，且 Bionic
-     *  FORTIFY 会在 SystemUI 被杀时打印 pthread_mutex_lock on destroyed mutex。
-     *
-     *  现在种子只保留血统明确的 3 类：
-     *   (a) is_guard_self = 1              → Guard 应用 UI/Service/子进程（只留守护二进制）
-     *   (b) GUARD_TASK=1 && wrapper = 1    → 脚本血统下的 su/sh/toybox/toolbox…包装层
-     *   (c) GUARD_TASK=1 && !wrapper && !protect → Phase B 异常兜底（理论不会发生）
-     *
-     *  SystemUI 等关键系统进程现在通过 is_critical_by_cmdline() 读完整 cmdline[0]
-     *  前缀来兜底标记 critical，不会再进入种子或扩散下游。 */
-    size_t seeds_wrapper = 0, seeds_app = 0, seeds_extra = 0;
-    for (size_t i = 0; i < count; i++) {
-        ProcRecord *r = &procs[i];
-        if (r->critical) continue;
-        if (r->protect)  continue;
-
-        if (r->is_guard_self) {
-            kill_flag[i] = true;
-            seeds_app++;
-            continue;
-        }
-
-        bool wrapper_seed = r->has_guard_task && r->is_script_wrapper;
-        if (wrapper_seed) {
-            kill_flag[i] = true;
-            seeds_wrapper++;
-            continue;
-        }
-
-        if (r->has_guard_task) {
-            kill_flag[i] = true;
-            seeds_extra++;
-            continue;
-        }
-
-        /* 不再按 uid>=10000 范围兜底，避免误伤 SystemUI/Launcher 等系统 App */
-    }
-    (void)seeds_extra;
-    /* ---- Phase D：后代传递 kill_flag（父杀 -> 子杀，除非子被 protect/critical）。
-     *   重要边界：如果父进程是 critical（例如守护自己的父进程 su、或是 zygote /
-     *   system_server 等系统进程），父即便被某个 seed 误命中 kill_flag 也不会真
-     *   的执行 kill，所以这里"父 kill_flag=true → 子继承"时要额外验证父并不是
-     *   critical，避免以 critical 作"扩散锚点"把整个系统树吞进来。*/
-    bool kill_changed;
-    do {
-        kill_changed = false;
-        for (size_t i = 0; i < count; i++) {
-            ProcRecord *r = &procs[i];
-            if (kill_flag[i] || r->critical || r->protect)
-                continue;
-            pid_t ppid = r->ppid;
-            if (ppid <= 0)
-                continue;
-            for (size_t j = 0; j < count; j++) {
-                if (procs[j].pid == ppid && kill_flag[j] && !procs[j].critical) {
-                    kill_flag[i] = true;
-                    kill_changed = true;
-                    break;
-                }
-            }
-        }
-    } while (kill_changed);
-
-    /* ---- 3) 深度层级，按深度从大到小排序，保证先杀子再杀父 ---- */
-    size_t int_bytes = MAX_PROC * sizeof(int);
-    int *depth = (int *)mmap(NULL, int_bytes, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    int *order = (int *)mmap(NULL, int_bytes, PROT_READ | PROT_WRITE,
-                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (depth == MAP_FAILED || order == MAP_FAILED) {
-        log_msg("[脚本清理] 内存不足，跳过\n");
-        if (depth != MAP_FAILED) munmap(depth, int_bytes);
-        if (order != MAP_FAILED) munmap(order, int_bytes);
-        munmap(kill_flag, kf_bytes);
-        munmap(procs, procs_bytes);
-        return;
-    }
-    memset(depth, 0, int_bytes);
-    memset(order, 0, int_bytes);
-
-    for (size_t i = 0; i < count; i++) {
-        order[i] = (int)i;
-        if (!kill_flag[i]) { depth[i] = -1; continue; }
-        int d = 0;
-        size_t cur = i;
-        /* 防止循环（极端异常），限制最多 255 层 */
-        while (d < 255) {
-            pid_t ppid = procs[cur].ppid;
-            if (ppid <= 0) break;
-            size_t j;
-            for (j = 0; j < count; j++) {
-                if (procs[j].pid == ppid) break;
-            }
-            if (j == count) break;
-            if (!kill_flag[j]) break;
-            cur = j;
-            d++;
-        }
-        depth[i] = d;
-    }
-
-    /* 按深度降序（插入排序；进程数通常小） */
-    for (size_t i = 1; i < count; i++) {
-        int t = order[i];
-        ssize_t j = (ssize_t)i - 1;
-        while (j >= 0 && depth[order[j]] < depth[t]) {
-            order[j + 1] = order[j];
-            j--;
-        }
-        order[j + 1] = t;
-    }
-
-    /* ---- 4) 收集 kill 列表，顺便统计保护数量 ----
-     * 注意 protect_n 口径：只数"真正的用户二进制白名单正本"（GUARD_TASK=1 且
-     * 非脚本包装层）。祖先链传播得到的 protect 副本/App UI/critical 不算在内，
-     * 否则会把同一次清理的保护数虚高，并随调用次数/脚本累积显得"越来越多"，
-     * 对用户判断自己后台二进制是否都被保护造成误导。 */
-    size_t kl_bytes = MAX_PROC * sizeof(pid_t);
-    pid_t *kill_list = (pid_t *)mmap(NULL, kl_bytes, PROT_READ | PROT_WRITE,
-                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    size_t kill_n = 0;
-    size_t protect_n = 0;
-    size_t protect_raw_n = 0;
-    if (kill_list == MAP_FAILED) {
-        log_msg("[脚本清理] 内存不足，跳过\n");
-        munmap(depth, int_bytes);
-        munmap(order, int_bytes);
-        munmap(kill_flag, kf_bytes);
-        munmap(procs, procs_bytes);
-        return;
-    }
-    memset(kill_list, 0, kl_bytes);
-
-    for (size_t oi = 0; oi < count; oi++) {
-        size_t idx = (size_t)order[oi];
-        if (procs[idx].critical) continue;         /* 绝对底线：守护/系统/关键进程即便误命中 flag 也不入 kill_list */
-        if (procs[idx].pid == me) continue;        /* 保险：守护 PID 不杀 */
-        if (procs[idx].pid == my_pp) continue;     /* 保险：父进程（su） 不杀 */
-        if (procs[idx].protect) {
-            protect_raw_n++;
-            /* 严格口径：只有 Phase B 的"真实原生二进制正本"才算白名单 */
-            if (procs[idx].has_guard_task && !procs[idx].is_script_wrapper && !procs[idx].is_jvm_app)
-                protect_n++;
-            continue;
-        }
-        if (!kill_flag[idx])
-            continue;
-        if (kill_n < MAX_PROC)
-            kill_list[kill_n++] = procs[idx].pid;
-    }
-
-    (void)protect_raw_n;
-
-    /* 调试辅助：将前 10 个被白名单保护的进程 (pid,name,exe) 追加到日志里，
-     * 方便用户/我们目测 protect_n 虚高时"到底保护了谁"。*/
-    if (protect_n > 0) {
-        size_t shown = 0;
-        char line[2048];
-        int l = 0;
-        l += snprintf(line + l, sizeof(line) - (size_t)l, "[脚本清理] 白名单样本(至多10)：");
-        for (size_t i = 0; i < count && shown < 10 && (size_t)l < sizeof(line) - 32; i++) {
-            ProcRecord *pr = &procs[i];
-            if (!pr->protect) continue;
-            if (!(pr->has_guard_task && !pr->is_script_wrapper && !pr->is_jvm_app)) continue;
-            const char *ex = pr->exe_link[0] ? pr->exe_link : (pr->cmdline0[0] ? pr->cmdline0 : "-");
-            l += snprintf(line + l, sizeof(line) - (size_t)l,
-                          "%spid=%d name=%s exe=%s",
-                          shown ? " | " : "",
-                          (int)pr->pid, pr->name, ex);
-            shown++;
-        }
-        if (l > 0) {
-            l += snprintf(line + l, sizeof(line) - (size_t)l, "\n");
-            log_msg("%s", line);
-        }
-    }
-
-    if (kill_n == 0) {
-        log_msg("[脚本清理] 无可清理残留（白名单保护 %zu 个用户管理进程），跳过\n", protect_n);
-        munmap(kill_list, kl_bytes);
-        munmap(depth, int_bytes);
-        munmap(order, int_bytes);
-        munmap(kill_flag, kf_bytes);
-        munmap(procs, procs_bytes);
-        return;
-    }
-
-    log_msg("[脚本清理] 清理种子：包装层 %zu / App UI %zu；白名单保护 %zu 个用户进程；将清理 %zu 个进程\n",
-            seeds_wrapper, seeds_app, protect_n, kill_n);
-
-    /* ---- 5) SIGTERM（第一轮，温柔退出） ---- */
-    for (size_t i = 0; i < kill_n; i++) {
-        (void)kill(kill_list[i], SIGTERM);
-    }
-
-    /* 给脚本 400ms 响应时间 */
-    struct timespec ts1;
-    ts1.tv_sec  = 0;
-    ts1.tv_nsec = 400L * 1000L * 1000L;
-    nanosleep(&ts1, NULL);
-
-    /* ---- 6) 再发 SIGKILL 处理未退出者 ---- */
-    for (size_t i = 0; i < kill_n; i++) {
-        pid_t pid = kill_list[i];
-        /* 若已退出（kill errno ESRCH）则忽略 */
-        if (kill(pid, SIGKILL) != 0 && errno == ESRCH)
-            continue;
-    }
-
-    /* 回收子进程，避免僵尸（su/logcat/sh 的短生命 wrapper） */
-    int ws = 0;
-    while (waitpid((pid_t)-1, &ws, WNOHANG) > 0) {}
-
-    log_msg("[脚本清理] 清理完毕，已结束 %zu 个进程（TERM→KILL）\n", kill_n);
-
-    /* ---- 7) 清理后复核：再扫一次 /proc，确认残留与保护效果 ----
-     * 统计仍存活的：
-     *   a) GUARD_TASK=1 且 is_script_wrapper=1 且 !critical 且 !protect 的进程
-     *      = 本该被清但没清掉的"残留包装层"（应该为 0 才算干净）
-     *   b) GUARD_TASK=1 且 !is_script_wrapper 的用户二进制保护数
-     *      = 仍存活的被管理后台程序（应>0，否则用户后台程序可能被杀了）
-     * 同时打印残留前 12 个样本 PID/Name，便于用户判断问题。
-     * ------------------------------------------------------------- */
-    {
-        CtxCheck cc;
-        memset(&cc, 0, sizeof(cc));
-        cc.me = me; cc.my_pp = my_pp;
-
-        /* ---- 7) 清理后复核：第一次 /proc 遍历 ----
-         * 统计包装层残留和用户二进制存活数。*/
-        proc_iterate(cb_check_stat, &cc);
-        size_t leftover_wrapper = cc.lw;
-        size_t protected_alive  = cc.pa;
-
-        /* ---- 8) 兜底再清理：若仍有残留包装层，本次复核直接逐个 SIGKILL ---- */
-        if (leftover_wrapper > 0) {
-            size_t kill2 = 0;
-
-            /* 第二次 /proc 遍历：收集残留包装层 PID */
-            cc.lk2n = 0;
-            proc_iterate(cb_check_gather, &cc);
-
-            for (size_t i = 0; i < cc.lk2n; i++) {
-                if (kill(cc.lk2[i], SIGKILL) == 0) kill2++;
-            }
-            struct timespec ts2;
-            ts2.tv_sec = 0; ts2.tv_nsec = 200L * 1000L * 1000L;
-            nanosleep(&ts2, NULL);
-            int ws2 = 0;
-            while (waitpid((pid_t)-1, &ws2, WNOHANG) > 0) {}
-
-            /* 第三次 /proc 遍历：最终复核 */
-            cc.fl = 0; cc.fp = 0; cc.sn2 = 0;
-            proc_iterate(cb_check_final, &cc);
-            size_t final_leftover = cc.fl;
-            size_t final_protect  = cc.fp;
-
-            if (final_leftover == 0) {
-                log_msg("[脚本清理] 复核残留 %zu 个，兜底 SIGKILL %zu 个后最终残留=0，用户二进制仍存活 %zu 个\n",
-                        leftover_wrapper, kill2, final_protect);
-            } else {
-                char sb2[512]; char *p2 = sb2; size_t left2 = sizeof(sb2); *p2 = '\0';
-                for (size_t i = 0; i < cc.sn2; i++) {
-                    int n = snprintf(p2, left2, "%s pid=%d%s",
-                                     cc.sn2_name[i], (int)cc.sn2_pid[i],
-                                     (i + 1 < cc.sn2) ? ", " : "");
-                    if (n <= 0 || (size_t)n >= left2) break;
-                    p2 += n; left2 -= (size_t)n;
-                }
-                log_msg("[脚本清理] 复核残留 %zu 个，兜底 SIGKILL %zu 个后仍剩 %zu 个，用户二进制仍存活 %zu 个。样本：%s\n",
-                        leftover_wrapper, kill2, final_leftover, final_protect, sb2);
-            }
-        } else {
-            log_msg("[脚本清理] 清理后复核：包装层残留 0 个（已清理干净），用户管理二进制仍存活 %zu 个\n",
-                    protected_alive);
-        }
-    }
-
-    munmap(kill_list, kl_bytes);
-    munmap(depth, int_bytes);
-    munmap(order, int_bytes);
-    munmap(kill_flag, kf_bytes);
-    munmap(procs, procs_bytes);
 }
 
 static void handle_event(const char *line)
