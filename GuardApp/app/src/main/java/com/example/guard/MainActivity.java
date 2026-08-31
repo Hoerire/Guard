@@ -1028,6 +1028,8 @@ public class MainActivity extends Activity {
     //       重开 loadHistoricLogs 时 guard.log→ui.log→再读 ui.log→指数级重复。
     void appendRawLog(String line){
         if(line==null||line.isEmpty()) return;
+        // 检测守护事件（pm disable/enable 和 cleanup 移到 Java 端执行）
+        handleGuardEvent(line);
         runOnUiThread(()->{
             synchronized (logLock) {
                 logBuffer.append(line).append("\n");
@@ -1251,6 +1253,154 @@ public class MainActivity extends Activity {
     // 解法：用 byte[] carry（上次残片）做前缀，先按 0x0A 切出整行；对最后一段不完整部分，
     // 做 UTF-8 结尾截断扫描：若末尾 1-3 字节是一个不完整的多字节序列前缀，就留下不 decode，
     // 下次与新字节合并再解，彻底避免 �。
+    // =============================================================
+    // 【极简守护架构】守护进程只做 logcat 监听 + 日志 + 配置热重载。
+    // 所有 pm disable/enable 和 cleanup 操作移到 Java 端，由 appendRawLog 检测
+    // 守护日志中的关键事件行后自己执行。这样守护进程完全不 fork/exec 任何
+    // 外部命令，变成单线程零堆分配的纯事件监听器，从根源消除崩溃。
+    // =============================================================
+
+    // ===== 守护事件处理：Java 端收到守护日志后，检测并执行对应操作 =====
+    static final java.util.Set<String> guardTargetApps = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    static final java.util.Set<String> guardFreezeApps = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    static volatile String guardLastForeground = "";
+    static volatile boolean guardTargetActive = false;
+
+    // 从 config.txt 读出 target 和 freeze 包名（Java 端自己做 pm 操作，需要知道包名）
+    void reloadGuardConfigLists(){
+        try{
+            guardTargetApps.clear(); guardFreezeApps.clear();
+            for(String line: java.nio.file.Files.readAllLines(cfgFile.toPath())){
+                int eq=line.indexOf('=');
+                if(eq<0) continue;
+                String k=line.substring(0,eq).trim();
+                String v=line.substring(eq+1).trim();
+                if(k.equals("target") && !v.isEmpty()) guardTargetApps.add(v);
+                else if(k.equals("freeze") && !v.isEmpty()) guardFreezeApps.add(v);
+            }
+        }catch(Exception ignored){}
+    }
+
+    // 用 su 批量执行 pm disable user 0 / pm enable user 0（一行命令搞定多个包）
+    void runPmDisableBatch(java.util.Collection<String> pkgs){
+        if(pkgs==null||pkgs.isEmpty()) return;
+        reloadGuardConfigLists();
+        StringBuilder cmd=new StringBuilder("su -c '");
+        cmd.append("for p in ");
+        boolean first=true;
+        for(String p: pkgs){
+            if(!guardFreezeApps.contains(p)) continue;  // 只处理 freeze 列表里的
+            if(first) first=false; else cmd.append(' ');
+            cmd.append(p.replace("'","\\'"));
+        }
+        if(first) return;  // 没要处理的
+        cmd.append("; do pm disable user 0 \"$p\" 2>/dev/null; done; for p in ");
+        first=true;
+        for(String p: pkgs){
+            if(!guardFreezeApps.contains(p)) continue;
+            if(first) first=false; else cmd.append(' ');
+            cmd.append(p.replace("'","\\'"));
+        }
+        cmd.append("; do pm disable \"$p\" 2>/dev/null; done'");
+        runSuCmd(cmd.toString());
+    }
+
+    void runPmEnableBatch(java.util.Collection<String> pkgs){
+        if(pkgs==null||pkgs.isEmpty()) return;
+        reloadGuardConfigLists();
+        StringBuilder cmd=new StringBuilder("su -c '");
+        cmd.append("for p in ");
+        boolean first=true;
+        for(String p: pkgs){
+            if(!guardFreezeApps.contains(p)) continue;
+            if(first) first=false; else cmd.append(' ');
+            cmd.append(p.replace("'","\\'"));
+        }
+        if(first) return;
+        cmd.append("; do pm enable user 0 \"$p\" 2>/dev/null; pm enable \"$p\" 2>/dev/null; done'");
+        runSuCmd(cmd.toString());
+    }
+
+    void runSuCmd(String cmd){
+        try{
+            Process p=new ProcessBuilder("su","-c",cmd).redirectErrorStream(true).start();
+            // 等结果不阻塞太久
+            java.io.BufferedReader br=new java.io.BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
+            StringBuilder sb=new StringBuilder(); String line; int cnt=0;
+            while((line=br.readLine())!=null && cnt++<50) sb.append(line).append('\n');
+            p.waitFor(30,java.util.concurrent.TimeUnit.SECONDS);
+            appendLog("[pm] "+(cmd.length()>80?cmd.substring(0,80)+"…":cmd));
+            if(sb.length()>0) appendLog("  → "+sb.toString().trim().replace("\n"," | "));
+        }catch(Exception e){ appendLog("[pm] 执行失败："+e.getMessage()); }
+    }
+
+    // 守护事件处理入口：在 appendRawLog 里被调用
+    // 守护日志中的关键行：
+    //   [前台事件] com.tencent.tmgp.cf 【目标应用】
+    //   [前台事件] com.android.launcher.Launcher 【普通应用】
+    //   [脚本清理] 收到外部清理请求...
+    void handleGuardEvent(String line){
+        if(line==null) return;
+        try{
+            // 前台事件
+            int idx=line.indexOf("[前台事件]");
+            if(idx>=0){
+                int tag1=line.indexOf("【目标应用】");
+                int tag2=line.indexOf("【普通应用】");
+                String pkg=line.substring(idx+"[前台事件]".length()).trim();
+                if(tag1>0) pkg=pkg.substring(0,pkg.indexOf("【目标应用】")).trim();
+                else if(tag2>0) pkg=pkg.substring(0,pkg.indexOf("【普通应用】")).trim();
+                pkg=pkg.replaceAll("/.*","");  // 去掉 Activity 后缀
+
+                boolean isTarget=tag1>0;
+                boolean wasTarget=guardTargetActive;
+
+                reloadGuardConfigLists();
+
+                if(isTarget && !wasTarget){
+                    // 进入目标应用 → 禁用 freeze 列表
+                    guardLastForeground=pkg;
+                    guardTargetActive=true;
+                    appendLog("[进入目标应用] "+pkg+" —— 批量禁用 "+guardFreezeApps.size()+" 个包");
+                    runPmDisableBatch(guardFreezeApps);
+                    // 同时触发 cleanup（清理脚本包装层）
+                    runJavaCleanup();
+                }else if(!isTarget && wasTarget){
+                    // 离开目标应用 → 恢复 freeze 列表
+                    guardTargetActive=false;
+                    appendLog("[离开目标应用] "+pkg+" —— 批量恢复 "+guardFreezeApps.size()+" 个包");
+                    runPmEnableBatch(guardFreezeApps);
+                }
+                return;
+            }
+
+            // 脚本清理事件（守护只记日志，实际清理由 Java 端做）
+            if(line.contains("[脚本清理] 收到外部清理请求")){
+                runJavaCleanup();
+                return;
+            }
+        }catch(Exception ignored){}
+    }
+
+    // Java 端 cleanup：su 执行 sh 清理脚本（和之前守护 fork+exec sh 的逻辑一样）
+    void runJavaCleanup(){
+        String cleanupSh =
+            "kill_one() { pid=$1; [ -z \"$pid\" ] && return; " +
+            "nm=$(cat /proc/$pid/comm 2>/dev/null) || return; " +
+            "case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) return ;; esac; " +
+            "tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -TERM $pid 2>/dev/null; } " +
+            "for p in /proc/[0-9]*; do kill_one \"${p##*/}\"; done; " +
+            "sleep 0.5; " +
+            "for p in /proc/[0-9]*; do " +
+            "  pid=${p##*/}; " +
+            "  nm=$(cat /proc/$pid/comm 2>/dev/null) || continue; " +
+            "  case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) continue ;; esac; " +
+            "  tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -KILL $pid 2>/dev/null; " +
+            "done";
+        runSuCmd(cleanupSh);
+    }
+
+    // =============================================================
     void startLogTailer(){
         if (logTailerRunning || (logTailerThread!=null && logTailerThread.isAlive())) return;
         logTailerRunning=true;
