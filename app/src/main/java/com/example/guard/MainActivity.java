@@ -153,7 +153,12 @@ public class MainActivity extends Activity {
         ftp.bottomMargin=dp(96);
         root.addView(floatToast,ftp);
 
-        homeScroll=new ScrollView(this);
+        homeScroll=new ScrollView(this){
+            @Override public boolean onInterceptTouchEvent(MotionEvent ev){
+                // 禁止主页整体滚动，让子控件（日志框等）独立处理触摸
+                return false;
+            }
+        };
         homeContent=new LinearLayout(this); homeContent.setOrientation(LinearLayout.VERTICAL);
         homeContent.setPadding(dp(20),dp(12),dp(20),dp(32));
         homeScroll.addView(homeContent); root.addView(homeScroll);
