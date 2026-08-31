@@ -1826,13 +1826,12 @@ public class MainActivity extends Activity {
                             "cd "+dirq+" && chmod +x "+path+" && export LD_LIBRARY_PATH="+dirq+":\"$LD_LIBRARY_PATH\" && exec "+path;
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }else{
-                        // sh 脚本：su 自己读文件 → base64 编码 → 解码 → 管道喂给 sh
-                        // 全程在 root shell 内，Java 不碰文件 IO。最终 exec 的 sh 进程
-                        // argv=["sh"]，无路径信息，实现匿名通道执行。
+                        // sh 脚本：直接 exec sh，路径通过参数传递
+                        // GUARD_TASK 等环境变量由 SCRIPT_ENV 注入
                         String run=
-                            "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
+                            "echo __GUARD_PID__=$$; "+
                             "cd "+dirq+"; "+SCRIPT_ENV+"; "+
-                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh";
+                            "exec /system/bin/sh "+path;
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }
                 }else{
@@ -1844,7 +1843,7 @@ public class MainActivity extends Activity {
                     }else{
                         pb=new ProcessBuilder("/system/bin/sh","-c",
                             "export GUARD_TASK=1; "+
-                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh");
+                            "exec /system/bin/sh "+path);
                     }
                     pb.directory(f.getParentFile());
                     Map<String,String> e=pb.environment();
