@@ -22,7 +22,7 @@
 #define MAX_CONFIG  8192
 #define MAX_TARGET  64
 #define MAX_FREEZE  64
-#define MAX_LOGCAT  8   /* 最多 8 个 events buffer（events, events_0..events_6） */
+#define MAX_LOGCAT  12  /* events + events_0..events_6 + main + system */
 
 /* ============ 全局 ============ */
 static volatile sig_atomic_t running = 1;
@@ -155,32 +155,107 @@ static bool comp_matches(const char *comp, const Package *list, size_t count) {
     return false;
 }
 
+/* 从一行 logcat 中提取包名，支持多种格式：
+   - events buffer: "wm_on_resume_called: [0xabc, com.example/.MainActivity, ...]" → {} 内最后一个字段
+   - main/system:    "Displayed com.example/.MainActivity" → "Displayed " 后的第一个字符串
+                    "Start proc com.example for activity com.example/.MainActivity" → activity 后的组件
+*/
+static bool extract_pkg(const char *line, char *out, size_t out_size) {
+    /* 格式 1: events buffer 花括号格式 — wm_on_resume_called / wm_on_top_resumed_gained_called
+       事件参数都在 [...] 或 {...} 中，最后一个字段是组件名 */
+    const char *brace = strchr(line, '{');
+    const char *close = brace ? strchr(brace + 1, '}') : NULL;
+    if (brace && close) {
+        /* 跳过中间空格，取花括号内最后一个 token */
+        const char *p = close - 1;
+        while (p > brace && (*p == ' ' || *p == ',' || *p == ']')) p--;
+        const char *end = p + 1;
+        while (p > brace && *p != ' ' && *p != ',' && *p != '[') p--;
+        if (*p == ' ' || *p == ',' || *p == '[') p++;
+        size_t len = end - p;
+        if (len > 0 && len < out_size) {
+            memcpy(out, p, len);
+            out[len] = '\0';
+            char *slash = strchr(out, '/');
+            if (slash) *slash = '\0';
+            return out[0] != '\0';
+        }
+    }
+
+    /* 格式 2: "Displayed com.example/.MainActivity ..." (ActivityTaskManager) */
+    const char *d = strstr(line, "Displayed ");
+    if (!d) d = strstr(line, "Displayed: ");
+    if (d) {
+        d += 10; /* 跳过 "Displayed " */
+        while (*d == ' ') d++;
+        size_t len = 0;
+        while (d[len] && d[len] != ' ' && d[len] != '\n' && d[len] != '\r') len++;
+        if (len > 0 && len < out_size) {
+            memcpy(out, d, len);
+            out[len] = '\0';
+            char *slash = strchr(out, '/');
+            if (slash) *slash = '\0';
+            return out[0] != '\0';
+        }
+    }
+
+    /* 格式 3: "TopResumedActivity com.example/.MainActivity" (dumpsys/trace) */
+    const char *t = strstr(line, "TopResumedActivity");
+    if (t) {
+        t += 18;
+        while (*t == ' ' || *t == '=') t++;
+        size_t len = 0;
+        while (t[len] && t[len] != ' ' && t[len] != '\n') len++;
+        if (len > 0 && len < out_size) {
+            memcpy(out, t, len);
+            out[len] = '\0';
+            char *slash = strchr(out, '/');
+            if (slash) *slash = '\0';
+            return out[0] != '\0';
+        }
+    }
+
+    /* 格式 4: "activity com.example/.MainActivity" (Start proc ... for activity ...) */
+    const char *a = strstr(line, " activity ");
+    if (!a) a = strstr(line, " activity=");
+    if (a) {
+        /* 找最后一个 "activity "（Start proc 行里可能有两个 com.example） */
+        const char *last = NULL;
+        const char *scan = line;
+        while ((a = strstr(scan, "activity ")) != NULL) { last = a; scan = a + 9; }
+        if (!last) scan = strstr(line, "activity=");
+        if (last) {
+            last += 9;
+            while (*last == ' ') last++;
+            size_t len = 0;
+            while (last[len] && last[len] != ' ' && last[len] != '\n' && last[len] != '/' && last[len] != ')') len++;
+            if (len > 0 && len < out_size) {
+                memcpy(out, last, len);
+                out[len] = '\0';
+                return out[0] != '\0';
+            }
+        }
+    }
+
+    return false;
+}
+
 static void process_line(char *line) {
-    if (!strstr(line, "wm_on_resume_called") && !strstr(line, "wm_on_top_resumed_gained_called"))
-        return;
+    /* 事件名匹配：覆盖 events buffer 和 main/system buffer 的常见事件 */
+    bool is_fg_event =
+        strstr(line, "wm_on_resume_called") ||
+        strstr(line, "wm_on_top_resumed_gained_called") ||
+        strstr(line, "wm_on_paused_called") ||
+        (strstr(line, "ActivityTaskManager") && (strstr(line, "Displayed") || strstr(line, "TopResumedActivity"))) ||
+        (strstr(line, "ActivityManager") && strstr(line, "Displayed"));
+
+    if (!is_fg_event) return;
+
+    char comp[MAX_PKG] = {0};
+    if (!extract_pkg(line, comp, sizeof(comp))) return;
+    if (!comp[0] || strcmp(comp, current_fg) == 0) return;
 
     reload_if_changed();
-
-    const char *brace = strchr(line, '{');
-    const char *end = brace ? strchr(brace + 1, '}') : NULL;
-    const char *pkg_start = NULL;
-
-    if (brace && end) {
-        const char *last_space = NULL;
-        for (const char *q = brace + 1; q < end; q++) if (*q == ' ') last_space = q;
-        pkg_start = last_space ? last_space + 1 : brace + 1;
-    }
-    if (!pkg_start || !*pkg_start) return;
-
-    char comp[MAX_PKG];
-    size_t pkg_len = end ? (size_t)(end - pkg_start) : strlen(pkg_start);
-    if (pkg_len >= sizeof(comp)) pkg_len = sizeof(comp) - 1;
-    strncpy(comp, pkg_start, pkg_len);
-    comp[pkg_len] = '\0';
-    char *slash = strchr(comp, '/');
-    if (slash) *slash = '\0';
-
-    if (!comp[0] || strcmp(comp, current_fg) == 0) return;
 
     bool target = comp_matches(comp, cfg.target, cfg.target_count);
     strncpy(current_fg, comp, sizeof(current_fg) - 1);
@@ -196,17 +271,23 @@ static pid_t fork_logcat(int out_fd, const char *buffer) {
         close(out_fd);
         int dn = open("/dev/null", O_WRONLY);
         if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
-        /* 动态构造 argv：logcat -b <buffer> -v brief -T 1 wm_on_resume_called:V wm_on_top_resumed_gained_called:V *:S */
-        const char *argv[10];
+        /* 动态构造 argv：logcat -b <buffer> -v raw -T 1 -s ActivityManager:D *:S
+           - events/main/system buffer 里 ActivityManager 事件覆盖前台切换
+           - D (Debug) 级别覆盖更广，兼容不同 ROM 的日志级别设置
+           - -v raw 输出原始格式，便于代码 strstr 过滤事件名
+           - -T 1 跳过历史，只看新事件 */
+        const char *argv[12];
         int a = 0;
         argv[a++] = "logcat";
         argv[a++] = "-b";
         argv[a++] = buffer;
         argv[a++] = "-v";
-        argv[a++] = "brief";
+        argv[a++] = "raw";
         argv[a++] = "-T";
         argv[a++] = "1";
-        argv[a++] = "wm_on_resume_called:V";
+        argv[a++] = "-s";
+        argv[a++] = "ActivityManager:D";
+        argv[a++] = "ActivityTaskManager:I";
         argv[a++] = "*:S";
         argv[a] = NULL;
         execvp(argv[0], (char *const *)argv);
@@ -257,10 +338,13 @@ int main(int argc, char **argv) {
     struct { int fd; pid_t pid; } pipes[MAX_LOGCAT];
     int pipe_count = 0;
 
-    /* 尝试的 buffer 名列表（Android 14+ 按 CPU 分桶） */
+    /* 尝试的 buffer 名列表
+       - events / events_0..events_6：Android events buffer（前台事件主要来源）
+       - main / system：部分 ROM 把 ActivityManager 事件放这里 */
     static const char *buffers[] = {
         "events", "events_0", "events_1", "events_2", "events_3",
-        "events_4", "events_5", "events_6", NULL
+        "events_4", "events_5", "events_6",
+        "main", "system", NULL
     };
 
     for (int i = 0; buffers[i] != NULL && pipe_count < MAX_LOGCAT; i++) {
