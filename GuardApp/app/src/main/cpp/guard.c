@@ -15,17 +15,16 @@
 #include <stdarg.h>
 
 /* ============ 常量 ============ */
-#define MAX_PATH         512
-#define MAX_LINE         4096
-#define MAX_PKG          256
-#define MAX_CONFIG       8192
-#define MAX_TARGET       64
-#define MAX_FREEZE       64
+#define MAX_PATH   512
+#define MAX_LINE   4096
+#define MAX_PKG    256
+#define MAX_CONFIG 8192
+#define MAX_TARGET 64
+#define MAX_FREEZE 64
 
-/* ============ 全局状态 ============ */
+/* ============ 全局 ============ */
 static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t cleanup_pending = 0;
-static volatile sig_atomic_t restart_logcat = 0;
 static char config_path[MAX_PATH];
 static char log_path[MAX_PATH];
 static char pid_path[MAX_PATH];
@@ -70,7 +69,6 @@ static void write_pidfile(void) {
         close(fd);
     }
 }
-
 static void remove_pidfile(void) { unlink(pid_path); }
 
 static void signal_handler(int sig) {
@@ -155,15 +153,10 @@ static bool comp_matches(const char *comp, const Package *list, size_t count) {
     return false;
 }
 
-/* 从 logcat brief events buffer 中提取包名
- * 示例:
- *   I/ActivityManager( 123): wm_on_resume_called(999): ActivityRecord{... com.tencent.tmgp.cf/.MainActivity}
- */
 static void process_line(char *line) {
     if (!strstr(line, "wm_on_resume_called") && !strstr(line, "wm_on_top_resumed_gained_called"))
         return;
 
-    /* 跳过重复：如果和上次 fg 一样就不处理（但要定期检查配置变化） */
     reload_if_changed();
 
     const char *brace = strchr(line, '{');
@@ -175,7 +168,6 @@ static void process_line(char *line) {
         for (const char *q = brace + 1; q < end; q++) if (*q == ' ') last_space = q;
         pkg_start = last_space ? last_space + 1 : brace + 1;
     }
-
     if (!pkg_start || !*pkg_start) return;
 
     char comp[MAX_PKG];
@@ -193,20 +185,14 @@ static void process_line(char *line) {
     log_msg("[前台事件] %s %s\n", comp, target ? "【目标应用】" : "【普通应用】");
 }
 
-/* ============ logcat 管道 ============ */
-static pid_t spawn_logcat(int pipe_read) {
-    /* 子进程直接 exec logcat，不做任何额外操作 */
+/* ============ Fork+exec logcat (fork 前零堆分配) ============ */
+static pid_t fork_logcat(int out_fd) {
     pid_t p = fork();
     if (p < 0) return -1;
     if (p == 0) {
-        /* 子：关闭 pipe read 端，把 pipe write 重定向到 stdout */
-        close(pipe_read);
-        /* 打开新的 pipe 让子进程写 */
-        int pipefd[2];
-        if (pipe(pipefd) < 0) _exit(1);
-        close(pipefd[0]);  /* 父读端 */
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
+        /* 子进程：直接 exec logcat，不做任何额外操作 */
+        dup2(out_fd, STDOUT_FILENO);
+        close(out_fd);
         int dn = open("/dev/null", O_WRONLY);
         if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
         const char *argv[] = { "logcat", "-b", "events", "-v", "brief", "-T", "1",
@@ -214,22 +200,49 @@ static pid_t spawn_logcat(int pipe_read) {
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
-    /* 父：close pipe write 端，返回子 PID */
     return p;
 }
 
 /* ============ main ============ */
 int main(int argc, char **argv) {
-    /* 重定向 stdin/stdout/stderr 全部到 /dev/null */
+    /* ===== 步骤 1: 重定向 stdin/stdout/stderr 到 /dev/null (syscalls only) ===== */
     int dn = open("/dev/null", O_RDWR);
     if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); close(dn); }
 
-    /* 初始化路径 */
-    const char *pkg = getenv("GUARD_PKG");
-    if (!pkg) pkg = "com.example.guard";
-    snprintf(config_path, sizeof(config_path), "/data/user/0/%s/files/config.txt", pkg);
-    snprintf(log_path, sizeof(log_path), "/data/user/0/%s/files/guard.log", pkg);
+    /* ===== 步骤 2: 确定路径 (snprintf 写栈，不碰堆) ===== */
+    if (argc >= 2 && argv[1][0] == '/') {
+        strncpy(config_path, argv[1], sizeof(config_path) - 1);
+    } else {
+        const char *pkg = getenv("GUARD_PKG");
+        if (!pkg) pkg = "com.example.guard";
+        snprintf(config_path, sizeof(config_path),
+                 "/data/user/0/%s/files/config.txt", pkg);
+    }
+    /* 手动取 config.txt 所在目录，拼出 log_path */
+    {
+        char *last_slash = strrchr(config_path, '/');
+        if (last_slash) {
+            size_t dlen = last_slash - config_path;
+            if (dlen >= MAX_PATH) dlen = MAX_PATH - 1;
+            char dir[MAX_PATH];
+            memcpy(dir, config_path, dlen);
+            dir[dlen] = '\0';
+            snprintf(log_path, sizeof(log_path), "%s/guard.log", dir);
+        }
+    }
     snprintf(pid_path, sizeof(pid_path), "%s.pid", config_path);
+
+    /* ===== 步骤 3: 创建 pipe (syscall) ===== */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return 1;
+
+    /* ===== 步骤 4: FORK (此时 guard 只执行了 syscalls + 栈变量，零堆分配) ===== */
+    pid_t lc_pid = fork_logcat(pipefd[1]);
+    close(pipefd[1]);  /* 父关写端 */
+    int lc_fd = pipefd[0];
+    if (lc_pid < 0) { close(lc_fd); return 1; }
+
+    /* ===== 步骤 5: 以下可以安全碰堆了（fork 已完成，子进程已 exec） ===== */
 
     /* 打开日志 */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -246,25 +259,11 @@ int main(int argc, char **argv) {
     reload_if_changed();
     write_pidfile();
     atexit(remove_pidfile);
-    log_msg("[Guard] 启动 PID=%d\n", (int)getpid());
 
-    /* 启动 logcat 管道 */
-    int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        log_msg("[错误] pipe 失败 errno=%d\n", errno);
-        return 1;
-    }
-    pid_t lc_pid = spawn_logcat(pipefd[0]);
-    close(pipefd[1]);  /* 父关 write */
-    int lc_fd = pipefd[0];
-    if (lc_pid < 0) {
-        log_msg("[错误] spawn_logcat 失败 errno=%d\n", errno);
-        close(lc_fd);
-        return 1;
-    }
+    log_msg("[Guard] 启动 PID=%d\n", (int)getpid());
     log_msg("[信息] logcat 监听已启动 PID=%d\n", (int)lc_pid);
 
-    /* 主循环：poll logcat pipe */
+    /* 主循环 */
     char line[MAX_LINE];
     size_t used = 0;
 
@@ -278,23 +277,20 @@ int main(int argc, char **argv) {
         struct pollfd pfd = { .fd = lc_fd, .events = POLLIN };
         int pr = poll(&pfd, 1, 500);
 
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
+        if (pr < 0) { if (errno == EINTR) continue; break; }
         if (pr == 0) continue;
         if (!(pfd.revents & POLLIN)) continue;
 
         char buf[512];
         ssize_t n = read(lc_fd, buf, sizeof(buf));
         if (n <= 0) {
-            /* logcat 退出，重启 */
+            /* logcat 退出 → 重启 */
             log_msg("[警告] logcat 退出，重启中…\n");
             close(lc_fd);
             int new_pipe[2];
             if (pipe(new_pipe) < 0) break;
             waitpid(lc_pid, NULL, WNOHANG);
-            lc_pid = spawn_logcat(new_pipe[0]);
+            lc_pid = fork_logcat(new_pipe[1]);
             close(new_pipe[1]);
             lc_fd = new_pipe[0];
             if (lc_pid < 0) {
