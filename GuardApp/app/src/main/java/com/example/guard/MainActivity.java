@@ -1272,9 +1272,14 @@ public class MainActivity extends Activity {
             guardTargetApps.clear(); guardFreezeApps.clear();
             for(String line: java.nio.file.Files.readAllLines(cfgFile.toPath())){
                 int eq=line.indexOf('=');
-                if(eq<0) continue;
-                String k=line.substring(0,eq).trim();
-                String v=line.substring(eq+1).trim();
+                int co=line.indexOf(':');
+                int sep=-1;
+                if(eq>=0 && co>=0) sep = Math.min(eq, co);
+                else if(eq>=0) sep = eq;
+                else if(co>=0) sep = co;
+                else continue;
+                String k=line.substring(0,sep).trim();
+                String v=line.substring(sep+1).trim();
                 if(k.equals("target") && !v.isEmpty()) guardTargetApps.add(v);
                 else if(k.equals("freeze") && !v.isEmpty()) guardFreezeApps.add(v);
             }
