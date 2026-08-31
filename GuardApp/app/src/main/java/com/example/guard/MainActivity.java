@@ -1832,7 +1832,7 @@ public class MainActivity extends Activity {
                         String run=
                             "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
                             "cd "+dirq+"; "+SCRIPT_ENV+"; "+
-                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh";
+                            "/system/bin/toybox base64 -e "+path+" | /system/bin/toybox base64 -d | /system/bin/sh";
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }
                 }else{
@@ -1844,7 +1844,7 @@ public class MainActivity extends Activity {
                     }else{
                         pb=new ProcessBuilder("/system/bin/sh","-c",
                             "export GUARD_TASK=1; "+
-                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh");
+                            "/system/bin/toybox base64 -e "+path+" | /system/bin/toybox base64 -d | /system/bin/sh");
                     }
                     pb.directory(f.getParentFile());
                     Map<String,String> e=pb.environment();
