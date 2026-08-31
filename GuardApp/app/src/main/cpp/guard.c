@@ -35,7 +35,9 @@
 #define MAX_FREEZE  64
 #define MAX_LOGCAT  3   /* events + main + system */
 #define MAX_POLL_FDS (MAX_LOGCAT + 1)  /* +1 for netlink connector */
-#define OOM_SCAN_INTERVAL_MS 800  /* oom_score_adj 兜底扫描间隔 */
+#define OOM_SCAN_INTERVAL_MS 800       /* netlink 正常时兜底扫描间隔 */
+#define OOM_SCAN_FALLBACK_MS 300       /* netlink 降级时加快扫描 */
+#define HEALTH_LOG_INTERVAL_S 60       /* 健康日志周期 */
 
 /* ============ 全局 ============ */
 static volatile sig_atomic_t running = 1;
@@ -354,14 +356,30 @@ static bool read_pkg_from_proc(pid_t pid, char *out, size_t out_size) {
 static bool looks_like_app(const char *name) {
     if (!name || !*name) return false;
     if (strncmp(name, "com.", 4) != 0) return false;
-    /* 排除一些常见的 com.* 系统包名 */
-    if (strcmp(name, "com.android.systemui") == 0) return false;
-    if (strcmp(name, "com.android.settings") == 0) return false;
+    /* 排除常见系统/厂商服务包名（这些可能永久 score=0） */
+    static const char *blacklist[] = {
+        "com.android.systemui",
+        "com.android.settings",
+        "com.android.launcher",
+        "com.android.launcher3",
+        "com.android.packageinstaller",
+        "com.android.permissioncontroller",
+        "com.oplus.appplatform",        /* OPPO 系统服务 */
+        "com.oplus.launcher",           /* OPPO 桌面 */
+        "com.coloros.launcher",         /* ColorOS 桌面 */
+        "com.heytap.market",            /* OPPO 市场 */
+        "com.android.system",
+        NULL
+    };
+    for (int i = 0; blacklist[i]; i++) {
+        if (strcmp(name, blacklist[i]) == 0) return false;
+    }
     return true;
 }
 
 /* 扫描 /proc，找前台应用（oom_score_adj == 0 且像应用包名）
-   找不到则 fallback 到 score 最低的应用进程 */
+   多个 score=0 时选 PID 最大的（最可能是最新前台）
+   找不到 score=0 则 fallback 到分数最低的应用进程 */
 static void run_oom_scan(long long now_ms) {
     int dir = open("/proc", O_RDONLY | O_DIRECTORY);
     if (dir < 0) return;
@@ -369,6 +387,7 @@ static void run_oom_scan(long long now_ms) {
     char ent_buf[8192];   /* 栈上，不碰堆 */
     int best_score = 10000;
     char best_pkg[MAX_PKG] = {0};
+    pid_t best_pid = 0;
     bool found_fg_zero = false;
 
     while (1) {
@@ -380,14 +399,12 @@ static void run_oom_scan(long long now_ms) {
             if (d->d_reclen == 0) break;
             off += d->d_reclen;
 
-            /* 只处理数字目录（进程 PID） */
             if (d->d_type != DT_DIR) continue;
             if (d->d_name[0] < '0' || d->d_name[0] > '9') continue;
 
             pid_t pid = atoi(d->d_name);
-            if (pid <= 100) continue;  /* 跳过 init/kthreadd 等 */
+            if (pid <= 100) continue;
 
-            /* 读 oom_score_adj */
             char path[64];
             snprintf(path, sizeof(path), "/proc/%d/oom_score_adj", pid);
             int ofd = open(path, O_RDONLY);
@@ -403,9 +420,10 @@ static void run_oom_scan(long long now_ms) {
             if (!read_pkg_from_proc(pid, pkg, sizeof(pkg))) continue;
             if (!looks_like_app(pkg)) continue;
 
-            /* 精确匹配前台: score == 0 */
             if (score == 0) {
-                if (!found_fg_zero || score < best_score) {
+                /* 多个 score=0：选 PID 最大的（最可能是最新 foreground） */
+                if (!found_fg_zero || pid > best_pid) {
+                    best_pid = pid;
                     best_score = score;
                     strncpy(best_pkg, pkg, sizeof(best_pkg) - 1);
                     found_fg_zero = true;
@@ -413,6 +431,7 @@ static void run_oom_scan(long long now_ms) {
             } else if (!found_fg_zero) {
                 /* 没找到 score==0 的，fallback 到分数最低的 */
                 if (score < best_score) {
+                    best_pid = pid;
                     best_score = score;
                     strncpy(best_pkg, pkg, sizeof(best_pkg) - 1);
                 }
@@ -486,7 +505,8 @@ static void restart_logcat_pipe(int idx) {
 static int netlink_init(void) {
     int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_CONNECTOR);
     if (fd < 0) {
-        log_msg("[Netlink] socket() 失败 errno=%d，降级到纯 oom 扫描\n", errno);
+        log_msg("[Netlink] socket(AF_NETLINK,NETLINK_CONNECTOR) 失败 errno=%d(%s)\n",
+                errno, strerror(errno));
         return -1;
     }
 
@@ -494,13 +514,13 @@ static int netlink_init(void) {
     addr.nl_family = AF_NETLINK;
     addr.nl_pid = getpid();
     if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        log_msg("[Netlink] bind() 失败 errno=%d\n", errno);
+        log_msg("[Netlink] bind(pid=%d) 失败 errno=%d(%s)\n",
+                getpid(), errno, strerror(errno));
         close(fd);
         return -1;
     }
 
-    /* 发送订阅命令：CN_PROC + PROC_CN_MCAST_LISTEN
-       构造 nlmsghdr + cn_msg + uint32_t(PROC_CN_MCAST_LISTEN) */
+    /* 发送订阅命令：CN_PROC + PROC_CN_MCAST_LISTEN */
     char send_buf[256];
     struct nlmsghdr *nlh = (struct nlmsghdr*)send_buf;
     nlh->nlmsg_len   = NLMSG_LENGTH(sizeof(struct cn_msg) + sizeof(uint32_t));
@@ -526,7 +546,8 @@ static int netlink_init(void) {
     ssize_t rc = sendto(fd, send_buf, nlh->nlmsg_len, 0,
                         (struct sockaddr*)&dst, sizeof(dst));
     if (rc < 0) {
-        log_msg("[Netlink] sendto() 订阅失败 errno=%d，降级\n", errno);
+        log_msg("[Netlink] sendto(PROC_CN_MCAST_LISTEN) 失败 errno=%d(%s) — "
+                "内核可能未启用 CONFIG_PROC_EVENTS\n", errno, strerror(errno));
         close(fd);
         return -1;
     }
@@ -571,11 +592,7 @@ static void handle_netlink_data(int fd) {
 
 /* ============ main ============ */
 int main(int argc, char **argv) {
-    /* ===== 步骤 1: 重定向 stdin/stdout/stderr 到 /dev/null ===== */
-    int dn = open("/dev/null", O_RDWR);
-    if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); close(dn); }
-
-    /* ===== 步骤 2: 确定路径 ===== */
+    /* ===== 步骤 1: 确定路径（纯字符串操作，无 fd） ===== */
     if (argc >= 2 && argv[1][0] == '/') {
         strncpy(config_path, argv[1], sizeof(config_path) - 1);
     } else {
@@ -597,15 +614,21 @@ int main(int argc, char **argv) {
     }
     snprintf(pid_path, sizeof(pid_path), "%s.pid", config_path);
 
-    /* ===== 步骤 3: 设置进程名为 "Guard" ===== */
+    /* ===== 步骤 2: 尽早打开日志文件 — netlink_init 和 fork 前就要能用 ===== */
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+
+    /* ===== 步骤 3: 重定向 stdin/stdout/stderr 到 /dev/null ===== */
+    int dn = open("/dev/null", O_RDWR);
+    if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); close(dn); }
+
+    /* ===== 步骤 4: 设置进程名为 "Guard" ===== */
     prctl(PR_SET_NAME, "Guard", 0, 0, 0);
     if (argv && argv[0]) {
         argv[0][0]='G'; argv[0][1]='u'; argv[0][2]='a';
         argv[0][3]='r'; argv[0][4]='d'; argv[0][5]='\0';
     }
 
-    /* ===== 步骤 4: fork 所有 logcat（堆分配前！）===== */
-
+    /* ===== 步骤 5: fork 所有 logcat（堆分配前！）===== */
     static const char *buffers[] = { "events", "main", "system", NULL };
     for (int i = 0; buffers[i] != NULL && g_pipe_count < MAX_LOGCAT; i++) {
         int pfd[2];
@@ -618,13 +641,8 @@ int main(int argc, char **argv) {
         g_pipe_count++;
     }
 
-    /* ===== 步骤 4.5: 创建 netlink CN_PROC socket =====
-       socket() 不碰堆，只创建 fd，安全在 fork 后做。
-       失败不致命，降级到纯 oom 扫描。 */
+    /* ===== 步骤 6: 创建 netlink CN_PROC socket（现在 log_fd 已开，错误可见）===== */
     g_netlink_fd = netlink_init();
-
-    /* ===== 步骤 5: 堆分配现在可以碰了 ===== */
-    log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
     struct sigaction sa = {0};
     sa.sa_handler = signal_handler;
@@ -638,12 +656,15 @@ int main(int argc, char **argv) {
     write_pidfile();
     atexit(remove_pidfile);
 
-    log_msg("[Guard] 启动 PID=%d，logcat %d 个，netlink=%s\n",
-            (int)getpid(), g_pipe_count, g_netlink_fd >= 0 ? "OK" : "降级");
+    int scan_interval = g_netlink_fd >= 0 ? OOM_SCAN_INTERVAL_MS : OOM_SCAN_FALLBACK_MS;
+    log_msg("[Guard] 启动 PID=%d，logcat %d 个，netlink=%s，扫描间隔=%dms\n",
+            (int)getpid(), g_pipe_count,
+            g_netlink_fd >= 0 ? "OK" : "降级(快速)", scan_interval);
 
     /* ===== 主循环 ===== */
     char line[MAX_LINE];
     size_t used = 0;
+    long long last_health_s = 0;
 
     while (running) {
         reload_if_changed();
@@ -652,14 +673,26 @@ int main(int argc, char **argv) {
             log_msg("[脚本清理] 收到外部清理请求，Java 端应执行清理\n");
         }
 
+        /* 健康日志：每 HEALTH_LOG_INTERVAL_S 秒输出一次状态 */
+        {
+            struct timespec hts; clock_gettime(CLOCK_MONOTONIC, &hts);
+            long long hnow = hts.tv_sec;
+            if (hnow - last_health_s >= HEALTH_LOG_INTERVAL_S) {
+                last_health_s = hnow;
+                log_msg("[心跳] logcat=%d netlink=%s fg=%s\n",
+                        g_pipe_count,
+                        g_netlink_fd >= 0 ? "OK" : "-",
+                        current_fg[0] ? current_fg : "?");
+            }
+        }
+
         /* poll 数组：logcat pipes [0..g_pipe_count-1] + netlink [末尾] */
         int nfds = g_pipe_count + (g_netlink_fd >= 0 ? 1 : 0);
         if (nfds == 0) {
-            /* 没 fd 就纯靠 oom 扫描 + sleep */
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             long long now = (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
             run_oom_scan(now);
-            usleep(OOM_SCAN_INTERVAL_MS * 1000);
+            usleep(scan_interval * 1000);
             continue;
         }
 
@@ -673,7 +706,7 @@ int main(int argc, char **argv) {
             pfds[g_pipe_count].events = POLLIN;
         }
 
-        int pr = poll(pfds, nfds, OOM_SCAN_INTERVAL_MS);
+        int pr = poll(pfds, nfds, scan_interval);
         if (pr < 0) { if (errno == EINTR) continue; break; }
 
         /* --- 先处理 netlink --- */
@@ -685,6 +718,7 @@ int main(int argc, char **argv) {
         for (int i = 0; i < g_pipe_count; i++) {
             short rev = pfds[i].revents;
             if (rev & (POLLHUP | POLLERR | POLLNVAL)) {
+                log_msg("[警告] logcat #%d revents=0x%x，重启\n", i, rev);
                 restart_logcat_pipe(i);
                 i--;
                 continue;
@@ -694,6 +728,7 @@ int main(int argc, char **argv) {
             char buf[512];
             ssize_t n = read(g_pipes[i].fd, buf, sizeof(buf));
             if (n <= 0) {
+                log_msg("[警告] logcat #%d read 返回 %zd，重启\n", i, n);
                 restart_logcat_pipe(i);
                 i--;
                 continue;
@@ -713,15 +748,16 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* --- oom_score_adj 兜底扫描 ---
-           触发条件：netlink 事件到达 → 立刻扫；或到周期了 → 兜底扫 */
+        /* --- oom_score_adj 扫描 ---
+           触发条件：netlink 事件到达 → 立刻扫；或到周期了 → 兜底扫
+           netlink 正常: 800ms; 降级: 300ms */
         {
             struct timespec ts;
             clock_gettime(CLOCK_MONOTONIC, &ts);
             long long now_ms = (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
 
             bool should = g_netlink_pending ||
-                          (now_ms - last_oom_scan_ms >= OOM_SCAN_INTERVAL_MS);
+                          (now_ms - last_oom_scan_ms >= scan_interval);
             g_netlink_pending = false;
             if (should) run_oom_scan(now_ms);
         }
