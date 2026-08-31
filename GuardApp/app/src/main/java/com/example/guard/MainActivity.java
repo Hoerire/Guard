@@ -1832,7 +1832,7 @@ public class MainActivity extends Activity {
                         String run=
                             "export GUARD_TASK=1; echo __GUARD_PID__=$$; "+
                             "cd "+dirq+"; "+SCRIPT_ENV+"; "+
-                            "/system/bin/toybox base64 -e "+path+" | /system/bin/toybox base64 -d | /system/bin/sh";
+                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh";
                         p=new ProcessBuilder("su","-c",run).redirectErrorStream(true).start();
                     }
                 }else{
@@ -1844,7 +1844,7 @@ public class MainActivity extends Activity {
                     }else{
                         pb=new ProcessBuilder("/system/bin/sh","-c",
                             "export GUARD_TASK=1; "+
-                            "/system/bin/toybox base64 -e "+path+" | /system/bin/toybox base64 -d | /system/bin/sh");
+                            "/system/bin/toybox base64 "+path+" | /system/bin/toybox base64 -d | /system/bin/sh");
                     }
                     pb.directory(f.getParentFile());
                     Map<String,String> e=pb.environment();
@@ -1962,6 +1962,7 @@ public class MainActivity extends Activity {
 
         termScroll=new ScrollView(this);
         termScroll.setVerticalScrollBarEnabled(true);
+        termScroll.setFocusable(false);
         termOut=new TextView(this);
         termOut.setTextSize(13);
         termOut.setTextColor(0xFFD8F0D8);
@@ -1969,6 +1970,8 @@ public class MainActivity extends Activity {
         termOut.setLineSpacing(dp(2),1f);
         termOut.setPadding(dp(12),dp(12),dp(12),dp(12));
         termOut.setBackground(round(0xFF10141C,dp(16)));
+        termOut.setTextIsSelectable(true);  // 支持长按选择复制终端输出
+        termOut.setLongClickable(true);
         termScroll.addView(termOut);
         LinearLayout.LayoutParams tl=new LinearLayout.LayoutParams(-1,0,1f);
         tl.setMargins(dp(14),dp(12),dp(14),dp(4));
