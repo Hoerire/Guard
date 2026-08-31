@@ -158,9 +158,16 @@ public class MainActivity extends Activity {
                 // 禁止主页整体滚动，让子控件（日志框等）独立处理触摸
                 return false;
             }
+            @Override public void scrollTo(int x, int y){
+                // 禁止程序化滚动，始终保持在顶部
+                super.scrollTo(0,0);
+            }
+            @Override public void setScrollY(int y){
+                super.setScrollY(0);
+            }
         };
         homeContent=new LinearLayout(this); homeContent.setOrientation(LinearLayout.VERTICAL);
-        homeContent.setPadding(dp(20),dp(12),dp(20),dp(32));
+        homeContent.setPadding(dp(20),dp(16),dp(20),dp(24));
         homeScroll.addView(homeContent); root.addView(homeScroll);
 
         pickerContent=new LinearLayout(this); pickerContent.setOrientation(LinearLayout.VERTICAL);
@@ -275,7 +282,7 @@ public class MainActivity extends Activity {
         logView.setTextIsSelectable(true);
         logView.setPadding(dp(2),dp(8),dp(2),dp(4));
         logScroll.addView(logView);
-        LinearLayout.LayoutParams lslp=new LinearLayout.LayoutParams(-1,dp(190));
+        LinearLayout.LayoutParams lslp=new LinearLayout.LayoutParams(-1,dp(160));
         lslp.setMargins(0,dp(4),0,0);
         logCard.addView(logScroll,lslp);
         // 修复与主页外层 ScrollView 的滚动冲突：日志框内触摸时，禁止外层拦截，使内部可独立滚动
@@ -446,6 +453,7 @@ public class MainActivity extends Activity {
         scriptContent.setVisibility(View.GONE);
         terminalContent.setVisibility(View.GONE);
         homeScroll.setVisibility(View.VISIBLE);
+        homeScroll.scrollTo(0,0);
         updateHomeCounts();
         updateStatus();
     }
