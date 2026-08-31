@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/poll.h>
 #include <stdarg.h>
@@ -20,19 +21,17 @@
 #define MAX_CONFIG       8192
 #define MAX_TARGET       64
 #define MAX_FREEZE       64
-#define EVENT_DEV        "/dev/log/events"
-#define EVENT_DEV_2      "/dev/log/events_0"
 
 /* ============ 全局状态 ============ */
 static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t cleanup_pending = 0;
+static volatile sig_atomic_t restart_logcat = 0;
 static char config_path[MAX_PATH];
 static char log_path[MAX_PATH];
 static char pid_path[MAX_PATH];
 static int  log_fd = -1;
-static int  event_fd = -1;
 
-/* ============ 日志（只写 log_fd）============ */
+/* ============ 日志 ============ */
 static void log_msg(const char *fmt, ...) {
     char buf[8192];
     int off = 0;
@@ -72,9 +71,7 @@ static void write_pidfile(void) {
     }
 }
 
-static void remove_pidfile(void) {
-    unlink(pid_path);
-}
+static void remove_pidfile(void) { unlink(pid_path); }
 
 static void signal_handler(int sig) {
     if (sig == SIGUSR1) cleanup_pending = 1;
@@ -83,7 +80,6 @@ static void signal_handler(int sig) {
 
 /* ============ 配置 ============ */
 typedef struct { char name[MAX_PKG]; } Package;
-
 typedef struct {
     Package target[MAX_TARGET];  size_t target_count;
     Package freeze[MAX_FREEZE];  size_t freeze_count;
@@ -94,7 +90,6 @@ static Config cfg;
 static char current_fg[MAX_PKG] = {0};
 static time_t config_mtime = 0;
 
-/* 找到行的分隔符（先找 ':' 再找 '='） */
 static char *find_sep(char *line) {
     char *c1 = strchr(line, ':');
     char *c2 = strchr(line, '=');
@@ -151,7 +146,6 @@ static bool reload_if_changed(void) {
     return true;
 }
 
-/* ============ 包匹配 ============ */
 static bool comp_matches(const char *comp, const Package *list, size_t count) {
     if (!comp) return false;
     for (size_t i = 0; i < count; i++) {
@@ -161,92 +155,67 @@ static bool comp_matches(const char *comp, const Package *list, size_t count) {
     return false;
 }
 
-/*
- * 解析 logcat events buffer 中的 ActivityManager resumed 事件
- * 格式 (briefer/brief):
+/* 从 logcat brief events buffer 中提取包名
+ * 示例:
  *   I/ActivityManager( 123): wm_on_resume_called(999): ActivityRecord{... com.tencent.tmgp.cf/.MainActivity}
- *   I/ActivityManager( 123): wm_on_top_resumed_gained_called(999): ActivityRecord{... com.android.launcher/.Launcher}
  */
-static void handle_events_data(const char *data, size_t len) {
-    static char line_buf[MAX_LINE];
-    static size_t line_used = 0;
+static void process_line(char *line) {
+    if (!strstr(line, "wm_on_resume_called") && !strstr(line, "wm_on_top_resumed_gained_called"))
+        return;
 
-    /* 按字节追加 */
-    if (line_used + len >= sizeof(line_buf)) { line_used = 0; }
-    memcpy(line_buf + line_used, data, len);
-    line_used += len;
+    /* 跳过重复：如果和上次 fg 一样就不处理（但要定期检查配置变化） */
+    reload_if_changed();
 
-    /* 按 \n 切行 */
-    char *start = line_buf;
-    char *nl;
-    while ((nl = memchr(start, '\n', line_used - (start - line_buf))) != NULL) {
-        *nl = '\0';
-        const char *tag = "wm_on_resume_called";
-        const char *tag2 = "wm_on_top_resumed_gained_called";
-        const char *p = strstr(start, tag);
-        bool handled = false;
-        if (!p) { p = strstr(start, tag2); handled = true; }
-        if (p) {
-            /* 找 { pkg/activity } 或最后一个空格+包名 */
-            const char *brace = strchr(p, '{');
-            const char *end = brace ? strchr(brace + 1, '}') : NULL;
-            const char *pkg_start = NULL;
-            if (brace && end) {
-                /* 从 { 到 } 之间找最后一个空格后的包名 */
-                const char *last_space = NULL;
-                for (const char *q = brace + 1; q < end; q++) if (*q == ' ') last_space = q;
-                if (last_space) pkg_start = last_space + 1;
-                else pkg_start = brace + 1;
-            } else {
-                /* fallback: 找最后的空格串 */
-                const char *last_space = NULL;
-                for (const char *q = p; q < start + line_used; q++) if (*q == ' ') last_space = q;
-                if (last_space) pkg_start = last_space + 1;
-            }
-            if (pkg_start && *pkg_start) {
-                char comp[MAX_PKG];
-                size_t pkg_len = end ? (size_t)(end - pkg_start) : strlen(pkg_start);
-                if (pkg_len >= sizeof(comp)) pkg_len = sizeof(comp) - 1;
-                strncpy(comp, pkg_start, pkg_len);
-                comp[pkg_len] = '\0';
-                char *slash = strchr(comp, '/');
-                if (slash) *slash = '\0';
-                if (comp[0] && strcmp(comp, current_fg) != 0) {
-                    reload_if_changed();
-                    bool target = comp_matches(comp, cfg.target, cfg.target_count);
-                    strncpy(current_fg, comp, sizeof(current_fg) - 1);
-                    log_msg("[前台事件] %s %s\n", comp, target ? "【目标应用】" : "【普通应用】");
-                }
-            }
-        }
-        start = nl + 1;
+    const char *brace = strchr(line, '{');
+    const char *end = brace ? strchr(brace + 1, '}') : NULL;
+    const char *pkg_start = NULL;
+
+    if (brace && end) {
+        const char *last_space = NULL;
+        for (const char *q = brace + 1; q < end; q++) if (*q == ' ') last_space = q;
+        pkg_start = last_space ? last_space + 1 : brace + 1;
     }
-    /* 未消费的尾部移到开头 */
-    if (start != line_buf) {
-        size_t remaining = line_used - (start - line_buf);
-        if (remaining > 0) memmove(line_buf, start, remaining);
-        line_used = remaining;
-    } else {
-        line_used = 0;
-    }
+
+    if (!pkg_start || !*pkg_start) return;
+
+    char comp[MAX_PKG];
+    size_t pkg_len = end ? (size_t)(end - pkg_start) : strlen(pkg_start);
+    if (pkg_len >= sizeof(comp)) pkg_len = sizeof(comp) - 1;
+    strncpy(comp, pkg_start, pkg_len);
+    comp[pkg_len] = '\0';
+    char *slash = strchr(comp, '/');
+    if (slash) *slash = '\0';
+
+    if (!comp[0] || strcmp(comp, current_fg) == 0) return;
+
+    bool target = comp_matches(comp, cfg.target, cfg.target_count);
+    strncpy(current_fg, comp, sizeof(current_fg) - 1);
+    log_msg("[前台事件] %s %s\n", comp, target ? "【目标应用】" : "【普通应用】");
 }
 
-/* 打开 event 设备 */
-static int open_event_dev(void) {
-    /* 尝试 /dev/log/events 再 fallback /dev/log/events_0 */
-    int fd = open(EVENT_DEV, O_RDONLY | O_NONBLOCK);
-    if (fd >= 0) {
-        log_msg("[事件源] %s (fd=%d)\n", EVENT_DEV, fd);
-        return fd;
+/* ============ logcat 管道 ============ */
+static pid_t spawn_logcat(int pipe_read) {
+    /* 子进程直接 exec logcat，不做任何额外操作 */
+    pid_t p = fork();
+    if (p < 0) return -1;
+    if (p == 0) {
+        /* 子：关闭 pipe read 端，把 pipe write 重定向到 stdout */
+        close(pipe_read);
+        /* 打开新的 pipe 让子进程写 */
+        int pipefd[2];
+        if (pipe(pipefd) < 0) _exit(1);
+        close(pipefd[0]);  /* 父读端 */
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int dn = open("/dev/null", O_WRONLY);
+        if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
+        const char *argv[] = { "logcat", "-b", "events", "-v", "brief", "-T", "1",
+            "wm_on_resume_called:V", "wm_on_top_resumed_gained_called:V", "*:S", NULL };
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
     }
-    fd = open(EVENT_DEV_2, O_RDONLY | O_NONBLOCK);
-    if (fd >= 0) {
-        log_msg("[事件源] %s (fd=%d)\n", EVENT_DEV_2, fd);
-        return fd;
-    }
-    log_msg("[警告] 无法打开事件源：%s 和 %s 都失败（errno=%d）\n",
-            EVENT_DEV, EVENT_DEV_2, errno);
-    return -1;
+    /* 父：close pipe write 端，返回子 PID */
+    return p;
 }
 
 /* ============ main ============ */
@@ -262,7 +231,7 @@ int main(int argc, char **argv) {
     snprintf(log_path, sizeof(log_path), "/data/user/0/%s/files/guard.log", pkg);
     snprintf(pid_path, sizeof(pid_path), "%s.pid", config_path);
 
-    /* 打开日志文件 */
+    /* 打开日志 */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
     /* 安装信号 */
@@ -272,71 +241,86 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGHUP, &sa, NULL);
     sigaction(SIGUSR1, &sa, NULL);
+    signal(SIGCHLD, SIG_IGN);
 
-    /* 首次读配置 */
     reload_if_changed();
-
-    /* 写 pidfile */
     write_pidfile();
     atexit(remove_pidfile);
-
     log_msg("[Guard] 启动 PID=%d\n", (int)getpid());
 
-    /* 打开事件设备 */
-    event_fd = open_event_dev();
+    /* 启动 logcat 管道 */
+    int pipefd[2];
+    if (pipe(pipefd) < 0) {
+        log_msg("[错误] pipe 失败 errno=%d\n", errno);
+        return 1;
+    }
+    pid_t lc_pid = spawn_logcat(pipefd[0]);
+    close(pipefd[1]);  /* 父关 write */
+    int lc_fd = pipefd[0];
+    if (lc_pid < 0) {
+        log_msg("[错误] spawn_logcat 失败 errno=%d\n", errno);
+        close(lc_fd);
+        return 1;
+    }
+    log_msg("[信息] logcat 监听已启动 PID=%d\n", (int)lc_pid);
 
-    /* 主循环：poll 事件设备 + 定期 reload 配置 */
+    /* 主循环：poll logcat pipe */
+    char line[MAX_LINE];
+    size_t used = 0;
+
     while (running) {
-        /* 定期 reload 配置 */
         reload_if_changed();
-
-        /* 处理 SIGUSR1 */
         if (cleanup_pending) {
             cleanup_pending = 0;
             log_msg("[脚本清理] 收到外部清理请求，Java 端应执行清理\n");
         }
 
-        if (event_fd >= 0) {
-            struct pollfd pfd = { .fd = event_fd, .events = POLLIN };
-            int pr = poll(&pfd, 1, 500);
-            if (pr < 0) {
-                if (errno == EINTR) continue;
-                /* poll 出错，尝试重新打开 */
-                log_msg("[警告] poll 事件源失败 errno=%d，尝试重开\n", errno);
-                close(event_fd);
-                event_fd = -1;
-                usleep(500 * 1000);
-                event_fd = open_event_dev();
-                continue;
+        struct pollfd pfd = { .fd = lc_fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 500);
+
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (pr == 0) continue;
+        if (!(pfd.revents & POLLIN)) continue;
+
+        char buf[512];
+        ssize_t n = read(lc_fd, buf, sizeof(buf));
+        if (n <= 0) {
+            /* logcat 退出，重启 */
+            log_msg("[警告] logcat 退出，重启中…\n");
+            close(lc_fd);
+            int new_pipe[2];
+            if (pipe(new_pipe) < 0) break;
+            waitpid(lc_pid, NULL, WNOHANG);
+            lc_pid = spawn_logcat(new_pipe[0]);
+            close(new_pipe[1]);
+            lc_fd = new_pipe[0];
+            if (lc_pid < 0) {
+                log_msg("[错误] 无法重启 logcat\n");
+                break;
             }
-            if (pr > 0 && (pfd.revents & POLLIN)) {
-                /* 一次性读完所有可用数据 */
-                char buf[4096];
-                while (1) {
-                    ssize_t n = read(event_fd, buf, sizeof(buf));
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        if (errno == EINTR) continue;
-                        /* 设备可能断开 */
-                        log_msg("[警告] read 事件源失败 errno=%d，重开\n", errno);
-                        close(event_fd); event_fd = -1;
-                        event_fd = open_event_dev();
-                        break;
-                    }
-                    if (n == 0) break;
-                    handle_events_data(buf, n);
-                }
-            }
-        } else {
-            /* 事件源不可用，简单 sleep 等下次重试 */
-            usleep(500 * 1000);
-            event_fd = open_event_dev();
+            continue;
+        }
+
+        if (used + n >= sizeof(line)) { used = 0; }
+        memcpy(line + used, buf, n);
+        used += n;
+
+        char *nl;
+        while ((nl = memchr(line, '\n', used)) != NULL) {
+            *nl = '\0';
+            process_line(line);
+            size_t consumed = nl - line + 1;
+            used -= consumed;
+            if (used > 0) memmove(line, line + consumed, used);
         }
     }
 
     log_msg("[Guard] 退出\n");
     remove_pidfile();
-    if (event_fd >= 0) close(event_fd);
+    if (lc_fd >= 0) close(lc_fd);
     if (log_fd >= 0) close(log_fd);
     return 0;
 }
