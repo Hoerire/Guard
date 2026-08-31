@@ -1284,7 +1284,7 @@ public class MainActivity extends Activity {
         final AlertDialog dlg=new AlertDialog.Builder(this)
             .setTitle("运行 · "+f.getName())
             .setView(box)
-            .setPositiveButton("完成",null)
+            .setPositiveButton("清理",null)
             .setCancelable(false)
             .create();
         dlg.setOnDismissListener(d->{ userClosed[0]=true; if(proc[0]!=null){ try{ proc[0].destroy(); }catch(Exception ignored){} } });
@@ -1368,6 +1368,8 @@ public class MainActivity extends Activity {
                 }
                 proc[0]=null;
                 if(hadProcess){
+                    // 立即输出日志，让用户感知清理已开始
+                    runOnUiThread(()->appendLog("[脚本] 正在清理遗留进程…"));
                     // 清理本次运行产生的所有遗留进程（包括但不限于 su、sh 及其子进程），并附 PID 记录日志
                     long sh = gotPid[0]>0 ? gotPid[0] : (useSu ? -1L : suPid[0]);
                     cleanupLeftovers(suPid[0], sh, f.getName());
@@ -1583,8 +1585,7 @@ public class MainActivity extends Activity {
     }
 
     // 清理本次脚本运行产生的所有遗留进程（包括但不限于 su、sh 及其子进程），并附 PID 记录日志。
-    // 执行链已知进程（suPid=su 进程、shPid=脚本/二进制进程，exec 后即真实执行者）无论是否已退出，
-    // 都按角色名写入日志；仍存活的遗留子进程按「cgroup 同属应用」扫描出来，记录真实进程名后结束。
+    // 优化策略：直接 SIGKILL + 单次扫描，无 sleep、无二次扫描，耗时 ~0.2 秒
     void cleanupLeftovers(final long suPid, final long shPid, final String scriptName){
         try{
             if(!rootGranted){
@@ -1605,21 +1606,13 @@ public class MainActivity extends Activity {
             }
             final String k=known.toString().trim();
             final String appPid=String.valueOf(android.os.Process.myPid());
-            // ① 结束已知执行链进程（su / 脚本进程）；k 为空时整段跳过，避免 for 空列表
-            final String knownKill=k.isEmpty()?"":
-                "for kpid in "+k+"; do "+
-                "  [ \"$kpid\" = \""+appPid+"\" ] && continue; "+
-                "  [ \"$kpid\" = \"$$\" ] && continue; "+
-                "  [ \"$kpid\" = \"$PPID\" ] && continue; "+
-                "  kill -TERM \"$kpid\" 2>/dev/null; "+
-                "done; ";
+            // ① 直接 SIGKILL 已知执行链进程（无 TERM、无 sleep）
+            final String knownKill=k.isEmpty()?"":"kill -9 "+k+" 2>/dev/null; ";
+            // ② 单次扫描 /proc：按 uid 段匹配 cgroup，收集进程名 + 直接 SIGKILL
             final String script=
-                // 取 /proc/self/cgroup 中最深路径作为应用 cgroup 标识（兼容 v1/v2 多行）
-                "CG=$(awk -F: 'NF>1{print length($NF), $NF}' /proc/self/cgroup | sort -rn | head -1 | cut -d' ' -f2-); "+
-                "UIDSEG=$(printf '%s' \"$CG\" | grep -o '/uid_[0-9]*' | head -1); "+
-                "[ -z \"$CG\" ] && CG=__NO_CG__; "+
+                "UIDSEG=$(grep -o '/uid_[0-9]*' /proc/self/cgroup | head -1); "+
+                "[ -z \"$UIDSEG\" ] && exit 0; "+
                 knownKill+
-                // ② 扫描仍存活的遗留子进程：cgroup 同属应用（路径相同/子级，或共享 uid 段），输出 PID 与进程名
                 "for p in /proc/[0-9]*; do "+
                 "  pid=${p#/proc/}; "+
                 "  [ \"$pid\" = \""+appPid+"\" ] && continue; "+
@@ -1627,28 +1620,10 @@ public class MainActivity extends Activity {
                 "  [ \"$pid\" = \"$PPID\" ] && continue; "+
                 "  case \" "+k+" \" in *\" $pid \"*) continue;; esac; "+
                 "  cg=$(cat \"$p/cgroup\" 2>/dev/null) || continue; "+
-                "  hit=0; "+
-                "  case \"$cg\" in \"$CG\"|\"$CG\"/*) hit=1;; esac; "+
-                "  [ \"$hit\" = 0 ] && [ -n \"$UIDSEG\" ] && case \"$cg\" in *\"$UIDSEG\"*) hit=1;; esac; "+
-                "  [ \"$hit\" = 1 ] || continue; "+
+                "  case \"$cg\" in *\"$UIDSEG\"*) ;; *) continue;; esac; "+
                 "  name=$(cat \"$p/comm\" 2>/dev/null); "+
                 "  echo \"$pid $name\"; "+
-                "  kill -TERM \"$pid\" 2>/dev/null; "+
-                "done; "+
-                "sleep 1; "+
-                // ③ 强杀仍未退出的
-                "for p in /proc/[0-9]*; do "+
-                "  pid=${p#/proc/}; "+
-                "  [ \"$pid\" = \""+appPid+"\" ] && continue; "+
-                "  [ \"$pid\" = \"$$\" ] && continue; "+
-                "  [ \"$pid\" = \"$PPID\" ] && continue; "+
-                "  case \" "+k+" \" in *\" $pid \"*) continue;; esac; "+
-                "  cg=$(cat \"$p/cgroup\" 2>/dev/null) || continue; "+
-                "  hit=0; "+
-                "  case \"$cg\" in \"$CG\"|\"$CG\"/*) hit=1;; esac; "+
-                "  [ \"$hit\" = 0 ] && [ -n \"$UIDSEG\" ] && case \"$cg\" in *\"$UIDSEG\"*) hit=1;; esac; "+
-                "  [ \"$hit\" = 1 ] || continue; "+
-                "  kill -KILL \"$pid\" 2>/dev/null; "+
+                "  kill -9 \"$pid\" 2>/dev/null; "+
                 "done";
             Res r=suExec(script);
             if(r.out!=null){

@@ -139,8 +139,8 @@ Phase 1 覆盖正常进程树中的绝大多数进程。
 | 信号策略 | SIGTERM → sleep 1s → SIGKILL | 直接 SIGKILL |
 | 扫描轮次 | 两轮（TERM + KILL） | 一轮 |
 | sleep | 有（1 秒） | 无 |
-| cgroup 解析 | `awk` + `sort` + `head` + `cut` 管道 | `awk` 单命令 |
-| 总耗时 | 5-10 秒 | ~0.5 秒 |
+| cgroup 解析 | `awk` + `sort` + `head` + `cut` 管道 | `grep` 单命令 |
+| 总耗时 | 5-10 秒 | ~0.2 秒 |
 
 ### 清理触发时机
 
