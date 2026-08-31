@@ -2133,6 +2133,94 @@ static bool reload_if_changed(void)
 
 int main(int argc, char **argv)
 {
+    /* ==== Phase 0：fork + exec self，彻底脱离祖先 pthread 状态 ====
+     *
+     * 守护进程被 Java 端通过 `nohup guard cfg > guard.log 2>&1 &` 启动，
+     * 链路是 Java App → su → sh → nohup → fork → exec guard。
+     *
+     * 根因：进程从 sh/nohup fork 出来时，**libc 内部 pthread_mutex_t 是在
+     * 父进程堆里初始化过的对象被 memcpy 复制过来**。父进程里这些 mutex 已
+     * 经经历过 init/lock/unlock/destroy，fork 后在守护进程里呈现"已初始化
+     * 但无线程真正持有"的悬空状态。cleanup 杀完一批进程触发 Scudo 堆分配
+     * 器复用同一 chunk 时，新对象的 mutex 初始化与旧 destroy 状态竞争 →
+     * Bionic FORTIFY "pthread_mutex_lock called on a destroyed mutex" →
+     * raise(SIGABRT) → 守护崩溃。
+     *
+     * 解法：先检查环境变量 GUARD_DEMONIZED=1（标记已经 exec 过一次）。
+     * 若未设置 → fork → 子进程设置 GUARD_DEMONIZED=1 + execve("/proc/self/exe",
+     * argv, environ)。execve 是关键：它让内核重新把我们的 ELF 加载到新地址空间，
+     * 同时 Bionic libc 从零初始化，所有 pthread_mutex_t 干净无状态，不再继承
+     * 任何祖先悬空锁。execve 后我们的地址空间完全是自己的，不再有 su/java/
+     * sh 进程的堆/栈/环境污染。
+     *
+     * fork 父进程（nohup/shell 的子进程）在 exec 前就 _exit()，让 init 接
+     * 管子进程（ppid=1），Java 端后续 pgrep/kill-0 能正确找到我们。
+     *
+     * 为什么不只用 setsid？setsid 只改变 session/group 归属，不影响内存；
+     * pthread 状态还是从父进程复制过来。必须 exec() 才能让内核重新初始化
+     * 整个 C 运行时。
+     *
+     * 为什么环境变量而不是 argv？argv 被 Java 端固定传 "config_path"，
+     * 加 "--daemon" 后缀需要同步改 Java 端；环境变量更干净，不需要改调用方。
+     */
+    const char *already_daemon = getenv("GUARD_DEMONIZED");
+    if (!already_daemon || strcmp(already_daemon, "1") != 0) {
+        pid_t p = fork();
+        if (p < 0) {
+            /* fork 失败，原始 stderr 还可用（此时还没 exec 也没重定向），
+             * 用 raw_write(fd=2) 直接写系统调用，不碰 FILE*。*/
+            raw_write(2, "[Guard][FATAL] pre-daemon fork failed: ");
+            raw_write_i(2, errno); raw_write(2, "\n");
+            return 1;
+        }
+        if (p > 0) {
+            /* 父进程 = Java 端 nohup/shell fork 出来的第一层。
+             * 它的 ppid 就是 nohup/shell，立即退出让 init 接管子进程。
+             * 不能 exit()，要用 _exit() 跳过 atexit/stdio cleanup 以免
+             * 触发我们还没来得及 exec 的悬空 pthread 锁。*/
+            _exit(0);
+        }
+        /* 子进程：setsid() 成新 session leader，断开控制终端 */
+        (void)setsid();
+
+        /* 继承环境变量 + 追加 GUARD_DEMONIZED=1，防止 exec 后无限循环 */
+        setenv("GUARD_DEMONIZED", "1", 1);
+
+        /* 立即 exec 自己：/proc/self/exe 是内核提供的自引用，
+         * 不管原始可执行文件是什么都能正确找到我们自己。
+         * exec 后 Bionic libc 重新加载，pthread mutex 全部零初始化。
+         *
+         * 环境变量保留原始 environ + GUARD_DEMONIZED=1（setenv 已修改过），
+         * 确保后续 popen("logcat", "r") 能找到 PATH，pm/cmd 等命令也正常。*/
+        execve("/proc/self/exe", argv, environ);
+
+        /* execve 失败（极少见：权限/SELinux/文件被删），用 raw_write 到 fd=2
+         * 告诉 Java 端，然后 _exit 不用 exit()。*/
+        raw_write(2, "[Guard][FATAL] execve self failed: ");
+        raw_write_i(2, errno); raw_write(2, "\n");
+        _exit(1);
+    }
+
+    /* 到这里，GUARD_DEMONIZED=1 说明我们已经是 exec 后的纯净守护：
+     *   - 被 init 接管（ppid=1）
+     *   - 独立 session leader（setsid）
+     *   - Bionic libc 刚从 exec 加载，pthread mutex 全干净
+     *   - 唯一的内存来源是我们自己的 ELF + 干净的 C 运行时 */
+
+    /* 重定向 stdin/stdout/stderr 到 /dev/null，断开 exec 前的 fd 继承。
+     * 守护日志完全走 log_msg() → write(log_fd, …)，不碰 stdio。*/
+    {
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) {
+            dup2(dn, 0);
+            dup2(dn, 1);
+            dup2(dn, 2);
+            if (dn > 2) close(dn);
+        } else {
+            close(0); close(1); close(2);
+        }
+    }
+
     if (argc >= 2 && argv[1] && argv[1][0])
         copy_str(config_file, sizeof(config_file), argv[1]);
     else
