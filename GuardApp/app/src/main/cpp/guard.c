@@ -16,12 +16,13 @@
 #include <stdarg.h>
 
 /* ============ 常量 ============ */
-#define MAX_PATH   512
-#define MAX_LINE   4096
-#define MAX_PKG    256
-#define MAX_CONFIG 8192
-#define MAX_TARGET 64
-#define MAX_FREEZE 64
+#define MAX_PATH    512
+#define MAX_LINE    4096
+#define MAX_PKG     256
+#define MAX_CONFIG  8192
+#define MAX_TARGET  64
+#define MAX_FREEZE  64
+#define MAX_LOGCAT  8   /* 最多 8 个 events buffer（events, events_0..events_6） */
 
 /* ============ 全局 ============ */
 static volatile sig_atomic_t running = 1;
@@ -187,17 +188,27 @@ static void process_line(char *line) {
 }
 
 /* ============ Fork+exec logcat (fork 前零堆分配) ============ */
-static pid_t fork_logcat(int out_fd) {
+static pid_t fork_logcat(int out_fd, const char *buffer) {
     pid_t p = fork();
     if (p < 0) return -1;
     if (p == 0) {
-        /* 子进程：直接 exec logcat，不做任何额外操作 */
         dup2(out_fd, STDOUT_FILENO);
         close(out_fd);
         int dn = open("/dev/null", O_WRONLY);
         if (dn >= 0) { dup2(dn, STDERR_FILENO); close(dn); }
-        const char *argv[] = { "logcat", "-b", "events", "-v", "brief", "-T", "1",
-            "wm_on_resume_called:V", "wm_on_top_resumed_gained_called:V", "*:S", NULL };
+        /* 动态构造 argv：logcat -b <buffer> -v brief -T 1 wm_on_resume_called:V wm_on_top_resumed_gained_called:V *:S */
+        const char *argv[10];
+        int a = 0;
+        argv[a++] = "logcat";
+        argv[a++] = "-b";
+        argv[a++] = buffer;
+        argv[a++] = "-v";
+        argv[a++] = "brief";
+        argv[a++] = "-T";
+        argv[a++] = "1";
+        argv[a++] = "wm_on_resume_called:V";
+        argv[a++] = "*:S";
+        argv[a] = NULL;
         execvp(argv[0], (char *const *)argv);
         _exit(127);
     }
@@ -219,7 +230,6 @@ int main(int argc, char **argv) {
         snprintf(config_path, sizeof(config_path),
                  "/data/user/0/%s/files/config.txt", pkg);
     }
-    /* 手动取 config.txt 所在目录，拼出 log_path */
     {
         char *last_slash = strrchr(config_path, '/');
         if (last_slash) {
@@ -233,33 +243,41 @@ int main(int argc, char **argv) {
     }
     snprintf(pid_path, sizeof(pid_path), "%s.pid", config_path);
 
-    /* ===== 步骤 2.5: 设置进程名为 "Guard"，必须在 fork 前 =====
-       prctl 改 comm 名 (/proc/pid/status Name)
-       argv[0] 改命令名 (ps / top)
-       这样 Java 端 aliveByPid() 用 "Guard" 就能匹配到 */
+    /* ===== 步骤 2.5: 设置进程名为 "Guard"（纯 syscall + 栈操作） ===== */
     prctl(PR_SET_NAME, "Guard", 0, 0, 0);
     if (argv && argv[0]) {
-        /* argv[0] 可安全覆写：原字符串 > 6 字节，"Guard" 只有 6 字节 */
-        argv[0][0] = 'G'; argv[0][1] = 'u'; argv[0][2] = 'a';
-        argv[0][3] = 'r'; argv[0][4] = 'd'; argv[0][5] = '\0';
+        argv[0][0]='G'; argv[0][1]='u'; argv[0][2]='a';
+        argv[0][3]='r'; argv[0][4]='d'; argv[0][5]='\0';
     }
 
-    /* ===== 步骤 3: 创建 pipe (syscall) ===== */
-    int pipefd[2];
-    if (pipe(pipefd) < 0) return 1;
+    /* ===== 步骤 3: 创建多个 pipe + FORK 多个 logcat =====
+       所有 fork() 必须在堆分配器被触碰之前！
+       events buffer 在多核设备上被分成 events + events_0..events_N
+    */
+    struct { int fd; pid_t pid; } pipes[MAX_LOGCAT];
+    int pipe_count = 0;
 
-    /* ===== 步骤 4: FORK (此时 guard 只执行了 syscalls + 栈变量，零堆分配) ===== */
-    pid_t lc_pid = fork_logcat(pipefd[1]);
-    close(pipefd[1]);  /* 父关写端 */
-    int lc_fd = pipefd[0];
-    if (lc_pid < 0) { close(lc_fd); return 1; }
+    /* 尝试的 buffer 名列表（Android 14+ 按 CPU 分桶） */
+    static const char *buffers[] = {
+        "events", "events_0", "events_1", "events_2", "events_3",
+        "events_4", "events_5", "events_6", NULL
+    };
 
-    /* ===== 步骤 5: 以下可以安全碰堆了（fork 已完成，子进程已 exec） ===== */
+    for (int i = 0; buffers[i] != NULL && pipe_count < MAX_LOGCAT; i++) {
+        int pfd[2];
+        if (pipe(pfd) < 0) continue;
+        pid_t lp = fork_logcat(pfd[1], buffers[i]);
+        close(pfd[1]);
+        if (lp < 0) { close(pfd[0]); continue; }
+        pipes[pipe_count].fd = pfd[0];
+        pipes[pipe_count].pid = lp;
+        pipe_count++;
+    }
 
-    /* 打开日志 */
+    /* ===== 步骤 4: 以下可以安全碰堆了（所有 fork 已完成） ===== */
+
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
-    /* 安装信号 */
     struct sigaction sa = {0};
     sa.sa_handler = signal_handler;
     sigaction(SIGTERM, &sa, NULL);
@@ -272,10 +290,9 @@ int main(int argc, char **argv) {
     write_pidfile();
     atexit(remove_pidfile);
 
-    log_msg("[Guard] 启动 PID=%d\n", (int)getpid());
-    log_msg("[信息] logcat 监听已启动 PID=%d\n", (int)lc_pid);
+    log_msg("[Guard] 启动 PID=%d，logcat 进程 %d 个\n", (int)getpid(), pipe_count);
 
-    /* 主循环 */
+    /* ===== 主循环: poll 所有 logcat pipe ===== */
     char line[MAX_LINE];
     size_t used = 0;
 
@@ -286,49 +303,85 @@ int main(int argc, char **argv) {
             log_msg("[脚本清理] 收到外部清理请求，Java 端应执行清理\n");
         }
 
-        struct pollfd pfd = { .fd = lc_fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 500);
-
-        if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) continue;
-        if (!(pfd.revents & POLLIN)) continue;
-
-        char buf[512];
-        ssize_t n = read(lc_fd, buf, sizeof(buf));
-        if (n <= 0) {
-            /* logcat 退出 → 重启 */
-            log_msg("[警告] logcat 退出，重启中…\n");
-            close(lc_fd);
-            int new_pipe[2];
-            if (pipe(new_pipe) < 0) break;
-            waitpid(lc_pid, NULL, WNOHANG);
-            lc_pid = fork_logcat(new_pipe[1]);
-            close(new_pipe[1]);
-            lc_fd = new_pipe[0];
-            if (lc_pid < 0) {
-                log_msg("[错误] 无法重启 logcat\n");
-                break;
+        if (pipe_count == 0) {
+            usleep(500 * 1000);
+            /* 下次重试 fork 一个 */
+            if (pipe_count == 0) {
+                int pfd[2];
+                if (pipe(pfd) >= 0) {
+                    pid_t lp = fork_logcat(pfd[1], "events");
+                    close(pfd[1]);
+                    if (lp >= 0) {
+                        pipes[0].fd = pfd[0];
+                        pipes[0].pid = lp;
+                        pipe_count = 1;
+                    } else close(pfd[0]);
+                }
             }
             continue;
         }
 
-        if (used + n >= sizeof(line)) { used = 0; }
-        memcpy(line + used, buf, n);
-        used += n;
+        struct pollfd pfds[MAX_LOGCAT];
+        for (int i = 0; i < pipe_count; i++) {
+            pfds[i].fd = pipes[i].fd;
+            pfds[i].events = POLLIN;
+        }
+        int pr = poll(pfds, pipe_count, 500);
 
-        char *nl;
-        while ((nl = memchr(line, '\n', used)) != NULL) {
-            *nl = '\0';
-            process_line(line);
-            size_t consumed = nl - line + 1;
-            used -= consumed;
-            if (used > 0) memmove(line, line + consumed, used);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+        if (pr == 0) continue;
+
+        for (int i = 0; i < pipe_count; i++) {
+            if (!(pfds[i].revents & POLLIN)) continue;
+
+            char buf[512];
+            ssize_t n = read(pipes[i].fd, buf, sizeof(buf));
+            if (n <= 0) {
+                /* 这个 logcat 退出了 → 重启 */
+                close(pipes[i].fd);
+                waitpid(pipes[i].pid, NULL, WNOHANG);
+                int new_pfd[2];
+                if (pipe(new_pfd) >= 0) {
+                    /* 找出刚才的 buffer 名 — 简化：重新 fork 用 "events" */
+                    pid_t lp = fork_logcat(new_pfd[1], "events");
+                    close(new_pfd[1]);
+                    if (lp >= 0) {
+                        pipes[i].fd = new_pfd[0];
+                        pipes[i].pid = lp;
+                        log_msg("[信息] logcat #%d 已重启 PID=%d\n", i, (int)lp);
+                    } else {
+                        close(new_pfd[0]);
+                        /* 移走这个位置 */
+                        for (int j = i; j < pipe_count - 1; j++) pipes[j] = pipes[j+1];
+                        pipe_count--;
+                        i--;
+                    }
+                } else {
+                    for (int j = i; j < pipe_count - 1; j++) pipes[j] = pipes[j+1];
+                    pipe_count--;
+                    i--;
+                }
+                continue;
+            }
+
+            if (used + n >= sizeof(line)) { used = 0; }
+            memcpy(line + used, buf, n);
+            used += n;
+
+            char *nl;
+            while ((nl = memchr(line, '\n', used)) != NULL) {
+                *nl = '\0';
+                process_line(line);
+                size_t consumed = nl - line + 1;
+                used -= consumed;
+                if (used > 0) memmove(line, line + consumed, used);
+            }
         }
     }
 
     log_msg("[Guard] 退出\n");
     remove_pidfile();
-    if (lc_fd >= 0) close(lc_fd);
+    for (int i = 0; i < pipe_count; i++) close(pipes[i].fd);
     if (log_fd >= 0) close(log_fd);
     return 0;
 }

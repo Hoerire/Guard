@@ -959,7 +959,11 @@ public class MainActivity extends Activity {
                     appendLog("[配置] 清理旧配置失败，改用 root 写入");
                 writeConfigFile(cfgFile, content);
             }
-            appendLog("[配置] 已保存：目标 "+t.size()+"，禁用 "+f.size()+" → "+cfgFile.getAbsolutePath());
+            StringBuilder tlist=new StringBuilder();
+            for(String p:t){ if(tlist.length()>0)tlist.append(","); tlist.append(p); }
+            StringBuilder flist=new StringBuilder();
+            for(String p:f){ if(flist.length()>0)flist.append(","); flist.append(p); }
+            appendLog("[配置] 已保存：目标 "+t.size()+"["+tlist+"]，禁用 "+f.size()+"["+flist+"] → "+cfgFile.getAbsolutePath());
         }catch(Exception e){
             if(rootGranted){
                 try{
@@ -1393,7 +1397,7 @@ public class MainActivity extends Activity {
             "kill_one() { pid=$1; [ -z \"$pid\" ] && return; " +
             "nm=$(cat /proc/$pid/comm 2>/dev/null) || return; " +
             "case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) return ;; esac; " +
-            "tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -TERM $pid 2>/dev/null; } " +
+            "tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -TERM $pid 2>/dev/null; }; " +
             "for p in /proc/[0-9]*; do kill_one \"${p##*/}\"; done; " +
             "sleep 0.5; " +
             "for p in /proc/[0-9]*; do " +
