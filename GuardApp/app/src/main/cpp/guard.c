@@ -14,6 +14,7 @@
 #include <sys/poll.h>
 #include <sys/syscall.h>
 #include <grp.h>
+#include <stdarg.h>
 
 /* ============ 常量 ============ */
 #define MAX_PATH         512
@@ -29,24 +30,13 @@ static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t cleanup_pending = 0;
 static char config_path[MAX_PATH];
 static char log_path[MAX_PATH];
+static char pid_path[MAX_PATH];
 static int  log_fd = -1;
 
-/* ============ 工具函数（全栈缓冲，零堆分配）============ */
-static void raw_write(int fd, const char *s) {
-    if (!s) return;
-    size_t n = strlen(s);
-    while (n > 0) {
-        ssize_t w = write(fd, s, n);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) break;
-        s += w; n -= w;
-    }
-}
-
+/* ============ 日志（只写 log_fd，不碰 stderr/stdout）============ */
 static void log_msg(const char *fmt, ...) {
     char buf[MAX_OUTPUT];
     int off = 0;
-    /* 时间戳（手动格式化，不走 strftime）*/
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     struct tm tm;
@@ -56,15 +46,12 @@ static void log_msg(const char *fmt, ...) {
         tm.tm_mon + 1, tm.tm_mday,
         tm.tm_hour, tm.tm_min, tm.tm_sec,
         ts.tv_nsec / 1000000);
-    /* 消息体 */
     va_list ap; va_start(ap, fmt);
     int want = vsnprintf(buf + off, sizeof(buf) - off, fmt, ap);
     va_end(ap);
     if (want > 0 && (size_t)want >= sizeof(buf) - off) want = sizeof(buf) - off - 1;
     off += want;
     if (off > 0 && buf[off-1] != '\n') buf[off++] = '\n';
-    /* 先写 stderr（调试用），再写日志文件 */
-    write(2, buf, off);
     if (log_fd >= 0) {
         size_t n = off, p = 0;
         while (n > 0) {
@@ -77,8 +64,6 @@ static void log_msg(const char *fmt, ...) {
 }
 
 static void write_pidfile(void) {
-    char pid_path[MAX_PATH];
-    snprintf(pid_path, sizeof(pid_path), "%s.guard_pid", config_path);
     int fd = open(pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         char buf[32];
@@ -89,8 +74,6 @@ static void write_pidfile(void) {
 }
 
 static void remove_pidfile(void) {
-    char pid_path[MAX_PATH];
-    snprintf(pid_path, sizeof(pid_path), "%s.guard_pid", config_path);
     unlink(pid_path);
 }
 
@@ -99,7 +82,7 @@ static void signal_handler(int sig) {
     else if (sig == SIGTERM || sig == SIGINT || sig == SIGHUP) running = 0;
 }
 
-/* ============ 配置 ============ */
+/* ============ 配置（兼容 Java 写的冒号 ":" 和旧版等号 "="）============ */
 typedef struct { char name[MAX_PKG]; } Package;
 
 typedef struct {
@@ -111,6 +94,14 @@ typedef struct {
 static Config cfg;
 static char current_fg[MAX_PKG] = {0};
 static time_t config_mtime = 0;
+
+/* 找到行的分隔符（先找 ':' 再找 '='） */
+static char *find_sep(char *line) {
+    char *c1 = strchr(line, ':');
+    char *c2 = strchr(line, '=');
+    if (c1 && c2) return (c1 < c2) ? c1 : c2;
+    return c1 ? c1 : c2;
+}
 
 static bool reload_if_changed(void) {
     struct stat st;
@@ -130,13 +121,21 @@ static bool reload_if_changed(void) {
     char *saveptr = NULL;
     char *line = strtok_r(buf, "\n", &saveptr);
     while (line) {
-        char *eq = strchr(line, '=');
-        if (eq) {
-            char *key = line;  char *val = eq + 1;  *eq = '\0';
+        /* 跳过注释和空行 */
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line == '\0' || *line == '#') { line = strtok_r(NULL, "\n", &saveptr); continue; }
+
+        char *sep = find_sep(line);
+        if (sep) {
+            char *key = line;  char *val = sep + 1;  *sep = '\0';
+            /* 去掉 key 的前后空白 */
             while (*key == ' ' || *key == '\t') key++;
+            char *ke = key + strlen(key) - 1;
+            while (ke > key && (*ke == ' ' || *ke == '\t')) *ke-- = '\0';
+            /* 去掉 val 的前后空白 */
             while (*val == ' ' || *val == '\t' || *val == '\r') val++;
-            char *end = val + strlen(val) - 1;
-            while (end > val && (*end == ' ' || *end == '\t' || *end == '\r')) *end-- = '\0';
+            char *ve = val + strlen(val) - 1;
+            while (ve > val && (*ve == ' ' || *ve == '\t' || *ve == '\r')) *ve-- = '\0';
 
             if (strcmp(key, "appuid") == 0) {
                 new_cfg.appuid = atoi(val);
@@ -166,7 +165,6 @@ static bool comp_matches(const char *comp, const Package *list, size_t count) {
 }
 
 static bool extract_component(const char *line, char *out, size_t out_sz) {
-    /* 从 logcat 事件中提取包名：wm_on_resume_called: ActivityRecord{... com.xxx/.yyy} */
     const char *tag = "wm_on_resume_called:";
     const char *tag2 = "wm_on_top_resumed_gained_called:";
     const char *p = strstr(line, tag);
@@ -176,7 +174,6 @@ static bool extract_component(const char *line, char *out, size_t out_sz) {
     if (!p) return false;
     const char *end = strchr(p + 1, '}');
     if (!end) return false;
-    /* 找最后一个空格后面的 "com.xxx/.yyy" */
     const char *last_space = NULL;
     for (const char *q = p + 1; q < end; q++) if (*q == ' ') last_space = q;
     if (!last_space) return false;
@@ -185,13 +182,12 @@ static bool extract_component(const char *line, char *out, size_t out_sz) {
     if (len >= out_sz) len = out_sz - 1;
     strncpy(out, pkg, len);
     out[len] = '\0';
-    /* 去掉 Activity 后缀，只留包名 */
     char *slash = strchr(out, '/');
     if (slash) *slash = '\0';
     return len > 0;
 }
 
-/* ============ 前台事件处理（只记日志 + 信号，不执行任何命令）============ */
+/* ============ 前台事件处理 ============ */
 static void handle_event(const char *line) {
     if (!line) return;
     if (!strstr(line, "wm_on_resume_called") && !strstr(line, "wm_on_top_resumed_gained_called"))
@@ -206,7 +202,6 @@ static void handle_event(const char *line) {
 
     bool target = comp_matches(comp, cfg.target, cfg.target_count);
     log_msg("[前台事件] %s %s\n", comp, target ? "【目标应用】" : "【普通应用】");
-    /* 到此为止！pm disable/enable 和 cleanup 全部由 Java 端自己处理 */
 }
 
 /* ============ logcat 事件读取 ============ */
@@ -237,29 +232,29 @@ int main(int argc, char **argv) {
     const char *tag = "GUARD_DEMONIZED";
     if (!getenv(tag) || strcmp(getenv(tag), "1") != 0) {
         pid_t p = fork();
-        if (p < 0) { write(2, "[Guard] fork fail\n", 18); return 1; }
+        if (p < 0) _exit(1);
         if (p > 0) _exit(0);
         setenv("SCUDO_OPTIONS", "strictness=0", 1);
         setenv(tag, "1", 1);
         setsid();
         execve("/proc/self/exe", argv, environ);
-        /* exec 失败兜底：double-fork */
         pid_t p2 = fork();
         if (p2 < 0) _exit(1);
         if (p2 > 0) _exit(0);
     }
 
-    /* 重定向 stdin/stdout 到 /dev/null，stderr 保留给 crash_handler */
+    /* 重定向 stdin/stdout/stderr 全部到 /dev/null */
     int dn = open("/dev/null", O_RDWR);
-    if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); close(dn); }
+    if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); close(dn); }
 
     /* 初始化路径 */
     const char *pkg = getenv("GUARD_PKG");
     if (!pkg) pkg = "com.example.guard";
     snprintf(config_path, sizeof(config_path), "/data/user/0/%s/files/config.txt", pkg);
     snprintf(log_path, sizeof(log_path), "/data/user/0/%s/files/guard.log", pkg);
+    snprintf(pid_path, sizeof(pid_path), "%s.pid", config_path);
 
-    /* 打开日志文件（O_APPEND 保证原子追加）*/
+    /* 打开日志文件 */
     log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
 
     /* 安装信号 */
@@ -271,7 +266,7 @@ int main(int argc, char **argv) {
     sigaction(SIGUSR1, &sa, NULL);
     signal(SIGCHLD, SIG_IGN);
 
-    /* 读配置（首次）*/
+    /* 首次读配置 */
     reload_if_changed();
 
     /* 写 pidfile */
@@ -289,7 +284,7 @@ int main(int argc, char **argv) {
     }
     log_msg("[信息] logcat events 监听已启动 PID=%d\n", (int)lc_pid);
 
-    /* 主循环：单线程 poll，零 fork，零堆分配 */
+    /* 主循环 */
     char line[MAX_LINE];
     size_t used = 0;
 
@@ -297,10 +292,8 @@ int main(int argc, char **argv) {
         struct pollfd pfd = { .fd = lc_fd, .events = POLLIN };
         int pr = poll(&pfd, 1, 1000);
 
-        /* 周期性检查配置变化 */
         reload_if_changed();
 
-        /* SIGUSR1 触发的清理（守护只记日志，实际清理由 Java 端做）*/
         if (cleanup_pending) {
             cleanup_pending = 0;
             log_msg("[脚本清理] 收到外部清理请求，Java 端应执行清理\n");
@@ -310,15 +303,13 @@ int main(int argc, char **argv) {
             if (errno == EINTR) continue;
             break;
         }
-        if (pr == 0) continue;  /* 超时，继续 */
+        if (pr == 0) continue;
 
         if (!(pfd.revents & POLLIN)) continue;
 
-        /* 读 logcat 输出 */
         char buf[512];
         ssize_t n = read(lc_fd, buf, sizeof(buf));
         if (n <= 0) {
-            /* logcat 退出，重启 */
             log_msg("[警告] logcat 退出，重启中…\n");
             close(lc_fd);
             waitpid(lc_pid, NULL, WNOHANG);
@@ -330,12 +321,10 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        /* 拼到行缓冲 */
-        if (used + n >= sizeof(line)) { used = 0; }  /* 防溢出 */
+        if (used + n >= sizeof(line)) { used = 0; }
         memcpy(line + used, buf, n);
         used += n;
 
-        /* 按 \n 切行处理 */
         char *nl;
         while ((nl = memchr(line, '\n', used)) != NULL) {
             *nl = '\0';
