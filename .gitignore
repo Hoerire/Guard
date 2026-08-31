@@ -1,54 +1,9 @@
-# 构建产物
-build/
-*.apk
-*.ap_
-*.dex
-*.class
-
-# 构建中间目录
-GuardApp/app/build/
-build/
-gen/
-obj/
-libs/
-*.o
-
-# Android 构建临时
-*.keystore !guard.keystore
-local.properties
-.gradle/
-.idea/
 *.iml
-.vscode/
+.gradle
+/local.properties
+/.idea
 .DS_Store
-
-# 工具链缓存（不提交到仓库）
-/data/user/work/
-
-# 临时上传 / 截图
-.uploads/
-.screenshots/
-.trae-html-share-packages/
-
-# Android Studio / Gradle 缓存
-.cxx/
-build/
-gradle/
-gradlew
-gradlew.bat
-*.iml
-.idea/
-local.properties
-
-# 临时 zip / 备份
-*.zip
-!GuardApp/app/src/main/assets/*.zip
-
-# 冗余文件（工作目录历史残留）
-Guard
-lightweight-hide-principle/
-酷安发帖草稿.md
-配置开发版草稿.md
-
-# 编译脚本产生的 APK 放到 build 目录，不提交
-GuardApp-*.apk
+/build
+/captures
+.externalNativeBuild
+.cxx
