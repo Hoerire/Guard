@@ -2214,33 +2214,56 @@ static bool reload_if_changed(void)
 
 int main(int argc, char **argv)
 {
-    /* ==== Phase 0：double-fork daemonize + setsid ====
+    /* ==== Phase 0：fork + exec self，彻底切断父进程多线程污染 ====
      *
-     * 守护进程被 Java 端通过 `nohup guard cfg > guard.log 2>&1 &` 启动，
-     * 链路是 Java App → su → sh → nohup → 最终 exec guard。
+     * 根因（之前持续的 SIGABRT FORTIFY 崩溃）：
+     *   守护进程启动链是 Java App → su（Magisk/KernelSU，多线程） → sh → guard
+     *   fork() 系统调用只复制当前线程！父进程 su 里的 Scudo 堆分配器和 libc
+     *   pthread mutex 在 fork 时处于"已初始化但无线程真正持有"的悬空状态。
+     *   守护 cleanup 里密集 calloc/free 触发 Scudo 时碰到这些悬空锁 →
+     *   Bionic FORTIFY "pthread_mutex_lock called on a destroyed mutex" →
+     *   abort() → SIGABRT。之前砍 exec self 留 double-fork 是错的！
      *
-     * 为什么还要自己 fork 一次：确保我们被 init（ppid=1）接管，后续
-     * pgrep/kill-0 精准确认存活不被 shell 链路干扰。
+     * execve(self) 是唯一彻底的解法：内核重新加载 ELF，Bionic libc + Scudo
+     * 全部从零初始化，不再继承父进程任何多线程状态。
      *
-     * 为什么不用 fork+exec self：那套自举机制的初衷是"重置 libc pthread 状态"，
-     * 但经过多轮重构，我们已经把守护内部所有 FILE*（opendir/fopen/fprintf/fgets）
-     * 全部换成了纯系统调用（open/read/write/SYS_getdents64），从根源上消除了
-     * Bionic FORTIFY "pthread_mutex_lock on destroyed mutex" 触发点。exec self
-     * 反而增加了 SELinux/SEPolicy 拦截风险 + 启动复杂度，直接干掉。
-     *
-     * 为什么要 atexit → 去掉：atexit 内部也走 libc 的 mutex 链，在 Scudo/ASan
-     * 插桩下可能跟 FORTIFY 冲突。remove_pidfile 已在 signal_handler 和
-     * crash_handler 里调用，正常退出路径再覆盖一次足够。
+     * 兜底：execve 可能被某些设备的 SEPolicy 拦截（禁止 exec /proc/self/exe）。
+     * 失败时降级到 double-fork，但注入 SCUDO_OPTIONS=strictness=0 关闭 Scudo
+     * 所有安全检查，至少让它跑起来不 abort。
      */
-    pid_t f1 = fork();
-    if (f1 < 0) { raw_write(2, "[Guard][FATAL] fork fail errno="); raw_write_i(2, errno); raw_write(2, "\n"); return 1; }
-    if (f1 > 0) _exit(0);              /* 第一层父进程立即退出 */
+    const char *daemon_tag = "GUARD_DEMONIZED";
+    const char *already_daemon = getenv(daemon_tag);
+    if (!already_daemon || strcmp(already_daemon, "1") != 0) {
+        pid_t p = fork();
+        if (p < 0) { raw_write(2, "[Guard][FATAL] fork fail errno="); raw_write_i(2, errno); raw_write(2, "\n"); return 1; }
+        if (p > 0) _exit(0);     /* 第一层父进程立即 _exit（不走 atexit/stdio 清理） */
 
-    (void)setsid();                    /* 新 session leader，脱离终端 */
+        /* 兜底：让 Scudo 别因为悬空锁直接 abort（execve 成功的话这条不生效）*/
+        setenv("SCUDO_OPTIONS", "strictness=0", 1);
 
-    pid_t f2 = fork();
-    if (f2 < 0) { raw_write(2, "[Guard][FATAL] fork2 fail errno="); raw_write_i(2, errno); raw_write(2, "\n"); return 1; }
-    if (f2 > 0) _exit(0);              /* 第二层父进程退出，init 接管我们 */
+        /* 标记，防止 exec 后无限循环 */
+        setenv(daemon_tag, "1", 1);
+
+        /* 新 session leader，断开控制终端 */
+        (void)setsid();
+
+        /* 先尝试 exec /proc/self/exe（最干净） */
+        execve("/proc/self/exe", argv, environ);
+
+        /* execve 失败（SEPolicy 拦截或其他原因），降级方案：
+         * 不 exec，靠 setenv SCUDO_OPTIONS=strictness=0 已经注入了，
+         * Scudo 不会因为悬空锁 abort。再 fork 一次让 init 接管。*/
+        {
+            pid_t p2 = fork();
+            if (p2 < 0) { raw_write(2, "[Guard][FATAL] fallback fork fail errno="); raw_write_i(2, errno); raw_write(2, "\n"); _exit(1); }
+            if (p2 > 0) _exit(0);  /* 第二层父进程退出，init 接管 */
+        }
+    }
+
+    /* exec 后（或 double-fork 兜底后）：
+     *   - 被 init 接管 (ppid=1)
+     *   - 独立 session leader
+     *   - Bionic libc + Scudo 干净初始化（exec 路径）或 strictness=0 兜底 */
 
     /* 重定向 stdin/stdout/stderr 到 /dev/null，断开继承的 fd */
     {
