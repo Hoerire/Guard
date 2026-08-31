@@ -72,6 +72,8 @@ public class MainActivity extends Activity {
     final StringBuilder logBuffer=new StringBuilder();
     Thread logTailerThread;
     volatile boolean logTailerRunning;
+    Thread fgPollerThread;
+    volatile boolean fgPollerRunning;
     long guardLogOffset;
     File uiLogFile(){ return new File(getFilesDir(),"ui.log"); }
     File guardLogFile(){ return new File(getFilesDir(),"guard.log"); }
