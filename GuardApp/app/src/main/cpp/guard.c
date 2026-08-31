@@ -29,6 +29,9 @@
 
 static char config_file[MAX_PATH];
 static char pid_file[MAX_PATH];    /* ${config_file}.pid —— Java 端 kill -0 校验存活用 */
+static char crash_file[MAX_PATH];   /* ${config_file}.crash —— 崩溃处理器落盘现场 */
+static char log_path[MAX_PATH];     /* guard.log —— 打开 fd 后用 write() 直写，绕开 FILE* FORTIFY */
+static int  log_fd = -1;            /* 直写 fd，不走 fprintf/vfprintf/fflush */
 
 #define DEFAULT_INTERVAL 2
 #define MIN_INTERVAL     1
@@ -187,29 +190,60 @@ static void signal_handler(int sig)
 
 static void log_msg(const char *fmt, ...)
 {
+    /* ⚠️ 绝对不能用 fprintf(stderr, …) / fflush(stderr)：
+     *
+     *   守护启动方式是 `nohup guard cfg > guard.log 2>&1 &`，
+     *   stderr FILE* 内部有 Bionic pthread_mutex_t。当 cleanup 杀完一批进程
+     *   （60 个进程时必崩，9 个时也崩），Scudo 堆分配器复用到 FILE* 同一 chunk
+     *   时 mutex 状态已被 destroy，Bionic FORTIFY 检测到 → raise(SIGABRT) →
+     *   守护崩溃，pidfile 被删，UI 提示"服务停止了"。
+     *
+     *   全部替换为 write() 系统调用直写 fd（log_fd = O_APPEND 打开的 guard.log），
+     *   完全绕开 FILE* / pthread_mutex_t / Scudo 堆分配器的 FILE 对象层。
+     *   时间戳用 snprintf 格式化到栈缓冲区，vsnprintf 格式化日志体（都不需要
+     *   FILE*，不堆分配）。write() 保证内核 O_APPEND 原子追加。
+     */
+    char buf[MAX_OUTPUT];   /* 64KB 栈缓冲足够容纳单次日志；vsnprintf 截断写 */
+    int off = 0;
+
+    /* 时间戳段：[YYYY-MM-DD HH:MM:SS.mmm] */
     char timebuf[32];
     struct timespec ts;
-
     if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
         struct tm tmv;
-
         localtime_r(&ts.tv_sec, &tmv);
-
-        strftime(timebuf, sizeof(timebuf),
-                 "%Y-%m-%d %H:%M:%S",
-                 &tmv);
-
-        fprintf(stderr, "[%s.%03ld] ",
-                timebuf,
-                ts.tv_nsec / 1000000L);
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", &tmv);
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+                        "[%s.%03ld] ", timebuf, ts.tv_nsec / 1000000L);
     }
 
+    /* 日志体段（用户 fmt 内容）—— vsnprintf 纯格式化到缓冲，不碰 FILE* */
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    int want = vsnprintf(buf + off, sizeof(buf) - (size_t)off, fmt, ap);
     va_end(ap);
+    if (want > 0) off += want;
+    if (off < 0) off = 0;
+    if ((size_t)off >= sizeof(buf)) off = (int)sizeof(buf) - 1;
+    buf[off] = '\0';
 
-    fflush(stderr);
+    /* 直写系统调用：绕过 FILE*，绕过 pthread_mutex_t，绕过 Scudo */
+    if (off > 0 && log_fd >= 0) {
+        size_t remain = (size_t)off;
+        char *p = buf;
+        while (remain > 0) {
+            ssize_t w = write(log_fd, p, remain);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            remain -= (size_t)w;
+            p += (size_t)w;
+        }
+    } else if (off > 0) {
+        /* 兜底：log_fd 还没开就 raw_write 到 stderr fd=2，绝对不用 FILE* */
+        raw_write(2, buf);
+    }
 }
 
 /* 写当前 PID 到 pid_file（格式一行纯文本），Java 端用 kill -0 精准确认存活，
@@ -2105,7 +2139,10 @@ int main(int argc, char **argv)
         copy_str(config_file, sizeof(config_file), DEFAULT_CONFIG);
 
     /* pidfile = ${config_file}.pid，Java 端 kill -0 精准确认存活；
-     * crash_file = ${config_file}.crash，崩溃信号处理器把现场写到这里 */
+     * crash_file = ${config_file}.crash，崩溃信号处理器把现场写到这里；
+     * log_path = ${config_dir}/guard.log，守护自己 O_APPEND 打开后用 write()
+     *          直写，彻底绕开 FILE* / pthread_mutex_t（fprintf(stderr,…)
+     *          在 cleanup 杀完一批进程后会触发 Bionic FORTIFY 崩溃）。 */
     {
         size_t cl = strlen(config_file);
         if (cl + strlen(".pid") + 1 <= sizeof(pid_file)) {
@@ -2117,7 +2154,25 @@ int main(int argc, char **argv)
             memcpy(crash_file, config_file, cl);
             memcpy(crash_file + cl, ".crash", 7);
         }
+        /* log_path：取 config_file 的目录部分 + "guard.log" */
+        const char *slash = strrchr(config_file, '/');
+        if (slash) {
+            size_t prefix = (size_t)(slash - config_file) + 1;
+            if (prefix + strlen("guard.log") + 1 <= sizeof(log_path)) {
+                memcpy(log_path, config_file, prefix);
+                memcpy(log_path + prefix, "guard.log", 10);
+                log_path[prefix + 10] = '\0';
+            }
+        }
+        if (!log_path[0]) {
+            copy_str(log_path, sizeof(log_path), "guard.log");
+        }
     }
+
+    /* 立刻以 O_APPEND 打开 guard.log，拿到直写 fd。
+     * 之后 log_msg() 全部走 write(log_fd, …)，不再碰 FILE*。
+     * 打开失败不致命：log_msg 有 raw_write(fd=2) 兜底。*/
+    log_fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
 
     /* 致命信号先落盘再死：SIGSEGV/SIGBUS/SIGABRT/SIGFPE/SIGILL/SIGSYS/SIGTRAP。
      * 必须装在 prctl/进入 main 逻辑之前，保证任何阶段（包括 ensure_config、
