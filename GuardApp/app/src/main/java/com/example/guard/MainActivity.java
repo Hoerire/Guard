@@ -72,8 +72,6 @@ public class MainActivity extends Activity {
     final StringBuilder logBuffer=new StringBuilder();
     Thread logTailerThread;
     volatile boolean logTailerRunning;
-    Thread fgPollerThread;
-    volatile boolean fgPollerRunning;
     long guardLogOffset;
     File uiLogFile(){ return new File(getFilesDir(),"ui.log"); }
     File guardLogFile(){ return new File(getFilesDir(),"guard.log"); }
@@ -1393,20 +1391,20 @@ public class MainActivity extends Activity {
         }catch(Exception ignored){}
     }
 
-    // Java 端 cleanup：单次 grep -sl 定位所有 GUARD_TASK=1 进程，然后 kill
-    // 比原来 per-PID fork(tr+grep) 快 10-20 倍
+    // Java 端 cleanup：su 执行 sh 清理脚本（和之前守护 fork+exec sh 的逻辑一样）
     void runJavaCleanup(){
         String cleanupSh =
-            "for f in $(grep -sl 'GUARD_TASK=1' /proc/[0-9]*/environ 2>/dev/null); do " +
-            "pid=${f%/environ}; pid=${pid##*/}; " +
-            "nm=$(cat /proc/$pid/comm 2>/dev/null) || continue; " +
-            "case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) kill -TERM $pid 2>/dev/null;; esac; " +
-            "done; " +
-            "sleep 0.2; " +
-            "for f in $(grep -sl 'GUARD_TASK=1' /proc/[0-9]*/environ 2>/dev/null); do " +
-            "pid=${f%/environ}; pid=${pid##*/}; " +
-            "nm=$(cat /proc/$pid/comm 2>/dev/null) || continue; " +
-            "case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) kill -KILL $pid 2>/dev/null;; esac; " +
+            "kill_one() { pid=$1; [ -z \"$pid\" ] && return; " +
+            "nm=$(cat /proc/$pid/comm 2>/dev/null) || return; " +
+            "case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) return ;; esac; " +
+            "tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -TERM $pid 2>/dev/null; }; " +
+            "for p in /proc/[0-9]*; do kill_one \"${p##*/}\"; done; " +
+            "sleep 0.5; " +
+            "for p in /proc/[0-9]*; do " +
+            "  pid=${p##*/}; " +
+            "  nm=$(cat /proc/$pid/comm 2>/dev/null) || continue; " +
+            "  case \"$nm\" in sh|su|toybox|toolbox|dash|bash|mksh|zsh) ;; *) continue ;; esac; " +
+            "  tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep -qx 'GUARD_TASK=1' && kill -KILL $pid 2>/dev/null; " +
             "done";
         runSuCmd(cleanupSh);
     }
